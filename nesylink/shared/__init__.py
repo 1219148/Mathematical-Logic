@@ -1,3 +1,3 @@
-from .types import SymbolicState
+from .types import EntityState, SymbolicState
 
-__all__ = ["SymbolicState"]
+__all__ = ["EntityState", "SymbolicState"]
