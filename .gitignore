@@ -4,6 +4,7 @@
 dist/
 build/
 __pycache__/
+.lake/
 *.pyc
 *.pyo
 *.pyd
