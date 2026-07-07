@@ -1,5 +1,9 @@
 import NesyLink.Environment
-import NesyLink.TaskInitStates
+import NesyLink.TaskInitStates_1
+import NesyLink.TaskInitStates_2
+import NesyLink.TaskInitStates_3
+import NesyLink.TaskInitStates_4
+import NesyLink.TaskInitStates_5
 open NesyLink
 
 namespace NesyLink
