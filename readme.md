@@ -36,6 +36,12 @@ pip install -e ".[pygame]"   # human-play/debug runner
 pip install -e ".[dreamer]"  # Dreamer-style image helper dependencies
 ```
 
+If pip fails with an SSL certificate verification error on macOS, fix the Python certificate chain first, then retry the command above. As a temporary fallback, you can also run:
+
+```bash
+python -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org pygame
+```
+
 ## Quick Start
 
 Use Gymnasium registration:

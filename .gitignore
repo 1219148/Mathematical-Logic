@@ -18,7 +18,9 @@ self_use/
 
 /tests/
 
+outputs/
+task_plan.md
+
 CLAUDE.md
 .claude/
-
 
