@@ -3,13 +3,11 @@ open NesyLink
 
 namespace NesyLink
 
--- ============================================================
--- Task 4：多房间（5 个房间），中心辐射式 + 旋转桥
+-- Task 4：多房间
 -- 起点 west → center（旋转桥） → north（拿钥匙）
 --            → center → east（拿剑，lockedKey 需钥匙）
 --            → center → south（杀怪，揭示 center 隐藏宝箱）
 --            → center → 隐藏宝箱（拿金币）
--- ============================================================
 
 -- 西房（起点，开局带盾 + 桥开关）
 def task4_westLayout : RoomLayout := {
@@ -202,7 +200,7 @@ def task4_southLayout : RoomLayout := {
   roomId              := "south"
 }
 
--- 地牢映射
+-- 映射
 def task4_roomMap : List (String × RoomLayout) := [
   ("west",   task4_westLayout),
   ("center", task4_centerLayout),

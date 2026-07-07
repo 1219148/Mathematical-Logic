@@ -95,9 +95,8 @@ structure SwitchInfo where
   stateOrder : List String
   deriving DecidableEq, Repr
 
--- ============================================================
+
 -- 房间布局 —— 永远不变的静态地图数据
--- ============================================================
 structure RoomLayout where
   walls               : List Position
   spawns              : List (String × Position)
@@ -115,9 +114,7 @@ structure RoomLayout where
   roomId              : String
   deriving DecidableEq, Repr
 
--- ============================================================
 -- 游戏状态 —— 随每一步变化的动态数据
--- ============================================================
 structure SymbolicState where
   player       : Position
   health       : Nat

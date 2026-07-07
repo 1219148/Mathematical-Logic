@@ -3,11 +3,9 @@ open NesyLink
 
 namespace NesyLink
 
--- ============================================================
--- Task 3：多房间（3 个房间），start_room → monster_hall → key_room
+-- Task 3：多房间
 -- 路线：起点(4,4) → 西走到 monster_hall → 西走到 key_room 拿钥匙
 --       原路返回 → start_room 东出口(lockedKey)通关
--- ============================================================
 
 -- 起点房间
 def task3_startLayout : RoomLayout := {
@@ -86,7 +84,7 @@ def task3_keyLayout : RoomLayout := {
   roomId              := "key_room"
 }
 
--- 地牢映射：房间 ID → 房间布局
+-- 映射
 def task3_roomMap : List (String × RoomLayout) := [
   ("start_room",   task3_startLayout),
   ("monster_hall", task3_hallLayout),

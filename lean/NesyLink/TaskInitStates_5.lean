@@ -3,13 +3,11 @@ open NesyLink
 
 namespace NesyLink
 
--- ============================================================
--- Task 5：多房间（4 个房间），原型地牢
+-- Task 5：多房间
 -- 路线：room_0_0 → 按按钮(2,6) → 南到 room_0_1 拿钥匙
 --            → 返回 → 东门(lockedKey) → room_1_0 宝箱(heal)
 --            → 返回 → 西门 → room_-1_0 宝箱(gold) + 双怪物
--- 通关条件：打开所有宝箱（all_chests_opened）
--- ============================================================
+-- 通关条件：打开所有宝箱
 
 -- 起点房间（中央枢纽）
 def task5_room00Layout : RoomLayout := {
@@ -128,7 +126,7 @@ def task5_roomMinus10Layout : RoomLayout := {
   roomId              := "room_-1_0"
 }
 
--- 地牢映射
+-- 映射
 def task5_roomMap : List (String × RoomLayout) := [
   ("room_0_0",  task5_room00Layout),
   ("room_1_0",  task5_room10Layout),
