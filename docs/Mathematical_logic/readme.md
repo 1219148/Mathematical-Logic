@@ -97,3 +97,62 @@
 - Lean 文件须通过检查，**不允许未说明的 `sorry` / `admit` / `axiom`**。
 - 若简化了真实环境，须在报告中说明；使用机器学习时不要求证明网络本身永远正确，但须指明 Lean 证明覆盖的可验证层。
 - 若提交的代码需要额外数据文件、配置文件或模型权重才能运行，须一并提交，并保证路径设置清晰、可复现。缺少关键文件导致无法运行的，相应部分按无法复现处理。
+
+## 七、Python Agent 补充说明与复现命令
+
+本仓库补充提供了一个基于**视觉感知 + 符号记忆 + 规则目标选择 + BFS/A\* 搜索 + safety shield** 的 Python Agent，入口为：
+
+```text
+submissions/student_agent.py
+```
+
+该 Agent 当前覆盖 `mathematical_logic/task_1` 至 `mathematical_logic/task_5`。策略推理阶段通过已有感知模块从图像帧 `obs` 中提取玩家、墙体、出口、宝箱、按钮、陷阱、桥与怪物等符号信息，并只额外读取测评接口显式提供的物品栏信息（如钥匙和装备）。当前提交策略不直接读取地图真值、房间编号、对象坐标或环境隐藏状态。
+
+Agent 部分的设计说明、t1-t5 策略分析、t5 调试取舍、可视化录像命令与测评结果见：
+
+```text
+docs/Mathematical_logic/报告.md
+```
+
+一键测评命令：
+
+```bash
+.venv/bin/python utils/evaluate_policy.py \
+  --policy submissions/student_agent.py \
+  --tasks mathematical_logic/task_1 mathematical_logic/task_2 mathematical_logic/task_3 mathematical_logic/task_4 mathematical_logic/task_5 \
+  --num-envs 1 \
+  --seed 0 \
+  --max-steps 1400 \
+  --json-out outputs/agent_eval_final.json
+```
+
+生成 t1-t5 Agent 运行录像的命令：
+
+```bash
+mkdir -p outputs/agent_videos
+for i in 1 2 3 4 5; do
+  .venv/bin/python utils/watch_agent.py \
+    --task mathematical_logic/task_${i} \
+    --policy submissions/student_agent.py \
+    --seed 0 \
+    --max-steps 1400 \
+    --no-window \
+    --video-out outputs/agent_videos/task_${i}.mp4 \
+    --video-fps 30
+done
+```
+
+如当前环境没有视频编码依赖，可先安装：
+
+```bash
+.venv/bin/python -m pip install "imageio[ffmpeg]>=2.34"
+```
+
+若 macOS 上遇到 PyPI SSL 证书问题，可临时使用：
+
+```bash
+.venv/bin/python -m pip install \
+  --trusted-host pypi.org \
+  --trusted-host files.pythonhosted.org \
+  "imageio[ffmpeg]>=2.34"
+```
