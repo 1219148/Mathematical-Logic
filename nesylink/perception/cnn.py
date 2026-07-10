@@ -6,7 +6,7 @@ import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -19,6 +19,8 @@ DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
 DEFAULT_DATASET = DEFAULT_DATA_DIR / "perception_dataset.npz"
 DEFAULT_WEIGHTS = Path(__file__).resolve().parent / "perception_model.pt"
 BUILTIN_TASKS = tuple(f"mathematical_logic/task_{idx}" for idx in range(1, 6))
+IMAGE_VARIANTS = ("default", "grayscale", "dark", "bright", "high_contrast", "inverted")
+_LUMA_WEIGHTS = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
 
 @dataclass(frozen=True)
@@ -114,7 +116,14 @@ class TinyPerceptionCNN(_BaseTorchModule()):
 
 
 class PerceptionDataset(_BaseTorchDataset()):
-    def __init__(self, dataset_path: str | Path, *, indices: np.ndarray, augment: bool = False) -> None:
+    def __init__(
+        self,
+        dataset_path: str | Path,
+        *,
+        indices: np.ndarray,
+        augment: bool = False,
+        variants: Sequence[str] = ("default",),
+    ) -> None:
         torch, _, Dataset = _torch_modules()
         super().__init__()
         del Dataset
@@ -125,21 +134,29 @@ class PerceptionDataset(_BaseTorchDataset()):
         self.monster_centers = data["monster_centers"][indices]
         self.monster_masks = data["monster_masks"][indices]
         self.augment = bool(augment)
+        self.variants = tuple(variants)
+        if not self.variants:
+            raise ValueError("variants must contain at least one image variant")
+        unknown_variants = sorted(set(self.variants) - set(IMAGE_VARIANTS))
+        if unknown_variants:
+            raise ValueError(f"unsupported image variants: {unknown_variants}")
         self.torch = torch
 
     def __len__(self) -> int:
-        return int(self.images.shape[0])
+        return int(self.images.shape[0]) * len(self.variants)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        image = self.images[index].astype(np.float32) / 255.0
+        sample_index = index // len(self.variants)
+        variant = self.variants[index % len(self.variants)]
+        image = apply_image_variant(self.images[sample_index], variant)
         if self.augment:
             image = _augment_image(image)
         image_tensor = self.torch.from_numpy(np.transpose(image, (2, 0, 1))).float()
-        grid_tensor = self.torch.from_numpy(self.grids[index].astype(np.int64))
+        grid_tensor = self.torch.from_numpy(self.grids[sample_index].astype(np.int64))
         heatmap = _make_heatmaps(
-            self.player_centers[index],
-            self.monster_centers[index],
-            self.monster_masks[index],
+            self.player_centers[sample_index],
+            self.monster_centers[sample_index],
+            self.monster_masks[sample_index],
         )
         return {
             "image": image_tensor,
@@ -229,8 +246,8 @@ def train_model(
     train_indices = indices[:split]
     val_indices = indices[split:] if split < sample_count else indices[: max(1, sample_count // 10)]
 
-    train_ds = PerceptionDataset(dataset_path, indices=train_indices, augment=True)
-    val_ds = PerceptionDataset(dataset_path, indices=val_indices, augment=False)
+    train_ds = PerceptionDataset(dataset_path, indices=train_indices, augment=True, variants=IMAGE_VARIANTS)
+    val_ds = PerceptionDataset(dataset_path, indices=val_indices, augment=False, variants=IMAGE_VARIANTS)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
@@ -349,6 +366,25 @@ def evaluate_model(model: Any, loader: Any, *, device: Any) -> dict[str, float]:
     }
 
 
+def evaluate_model_variants(
+    model: Any,
+    dataset_path: str | Path,
+    *,
+    device: Any,
+    batch_size: int,
+    variants: Sequence[str] = IMAGE_VARIANTS,
+) -> dict[str, dict[str, float]]:
+    torch, _, _ = _torch_modules()
+    data = np.load(dataset_path)
+    indices = np.arange(data["images"].shape[0])
+    results: dict[str, dict[str, float]] = {}
+    for variant in variants:
+        ds = PerceptionDataset(dataset_path, indices=indices, augment=False, variants=(variant,))
+        loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
+        results[variant] = evaluate_model(model, loader, device=device)
+    return results
+
+
 def _tile_class_weights(grids: np.ndarray) -> Any:
     torch, _, _ = _torch_modules()
     counts = np.bincount(grids.reshape(-1).astype(np.int64), minlength=NUM_TILE_CLASSES).astype(np.float32)
@@ -384,7 +420,7 @@ def predict_frame(
 ) -> dict[str, Any]:
     torch = torch_module if torch_module is not None else _torch_modules()[0]
     resolved_device = _resolve_device(torch, device)
-    image = frame.astype(np.float32) / 255.0
+    image = apply_image_variant(frame, "default")
     tensor = torch.from_numpy(np.transpose(image, (2, 0, 1))).unsqueeze(0).float().to(resolved_device)
     with torch.no_grad():
         output = model(tensor)
@@ -636,6 +672,37 @@ def _draw_gaussian(heatmap: np.ndarray, center: np.ndarray, *, sigma: float) -> 
     heatmap[y0:y1, x0:x1] = np.maximum(heatmap[y0:y1, x0:x1], patch)
 
 
+def apply_image_variant(image: np.ndarray, variant: str) -> np.ndarray:
+    """Apply one of the supported color/brightness variants and return float RGB."""
+    arr = np.asarray(image).astype(np.float32)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"image variant input must be HxWx3 RGB, got shape={arr.shape}")
+    if arr.max(initial=0.0) > 1.0:
+        arr = arr / 255.0
+
+    if variant == "default":
+        out = arr
+    elif variant == "grayscale":
+        gray = _rgb_to_luma(arr)
+        out = np.repeat(gray[..., None], 3, axis=2)
+    elif variant == "dark":
+        out = arr * 0.45
+    elif variant == "bright":
+        out = arr * 1.35 + 0.15
+    elif variant == "high_contrast":
+        gray = _rgb_to_luma(arr)
+        out = np.repeat((gray >= 0.5).astype(np.float32)[..., None], 3, axis=2)
+    elif variant == "inverted":
+        out = 1.0 - arr
+    else:
+        raise ValueError(f"unsupported image variant: {variant}")
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def _rgb_to_luma(image: np.ndarray) -> np.ndarray:
+    return np.tensordot(image[..., :3], _LUMA_WEIGHTS, axes=([-1], [0])).astype(np.float32)
+
+
 def _augment_image(image: np.ndarray) -> np.ndarray:
     # 颜色增强用于避免模型只记住固定 RGB；测试渲染细节变化时会更稳。
     rng = np.random.default_rng()
@@ -716,6 +783,7 @@ def main(argv: list[str] | None = None) -> None:
     eval_parser.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     eval_parser.add_argument("--batch-size", type=int, default=64)
     eval_parser.add_argument("--device", default="auto")
+    eval_parser.add_argument("--variant", choices=(*IMAGE_VARIANTS, "all"), default="default")
 
     args = parser.parse_args(argv)
     if args.command == "collect":
@@ -761,11 +829,20 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "eval":
         torch, _, _ = _torch_modules()
         model, _torch = load_model(args.weights, device=args.device)
-        data = np.load(args.data)
-        indices = np.arange(data["images"].shape[0])
-        ds = PerceptionDataset(args.data, indices=indices, augment=False)
-        loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
-        metrics = evaluate_model(model, loader, device=_resolve_device(torch, args.device))
+        resolved_device = _resolve_device(torch, args.device)
+        if args.variant == "all":
+            metrics = evaluate_model_variants(
+                model,
+                args.data,
+                device=resolved_device,
+                batch_size=args.batch_size,
+            )
+        else:
+            data = np.load(args.data)
+            indices = np.arange(data["images"].shape[0])
+            ds = PerceptionDataset(args.data, indices=indices, augment=False, variants=(args.variant,))
+            loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+            metrics = evaluate_model(model, loader, device=resolved_device)
         print(json.dumps(metrics, indent=2))
 
 

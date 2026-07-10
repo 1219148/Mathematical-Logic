@@ -20,7 +20,7 @@ self_use/
 
 outputs/
 task_plan.md
+nesylink/perception/data/generated_maps/
 
 CLAUDE.md
 .claude/
-

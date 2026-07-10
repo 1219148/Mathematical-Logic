@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -61,21 +62,24 @@ class PerceptionEngine:
             confidence_threshold=self.confidence_threshold,
         )
         grid = prediction["grid"]
+        player_grid_tile = _first_tile(grid, TILE_PLAYER)
+        monster_grid_tiles = _all_tiles(grid, TILE_MONSTER)
+
         player_entity = _entity_from_detection(prediction.get("player"), "player")
+        if player_entity is not None and player_grid_tile is not None:
+            player_entity = replace(player_entity, tile=player_grid_tile)
         monster_entities = tuple(
-            entity
+            _snap_entity_to_grid(entity, monster_grid_tiles)
             for detection in prediction.get("monsters", ())
             if (entity := _entity_from_detection(detection, "monster")) is not None
         )
 
-        player_tile = _first_tile(grid, TILE_PLAYER)
-        if player_entity is not None:
-            player_tile = player_entity.tile
+        player_tile = player_grid_tile
         if player_tile is None:
-            player_tile = (-1, -1)
+            player_tile = player_entity.tile if player_entity is not None else (-1, -1)
 
         monster_tiles = {entity.tile for entity in monster_entities}
-        monster_tiles.update(_all_tiles(grid, TILE_MONSTER))
+        monster_tiles.update(monster_grid_tiles)
 
         return SymbolicState(
             player=player_tile,
@@ -139,6 +143,15 @@ def _entity_from_detection(detection: dict | None, kind: str) -> EntityState | N
         entity_type=str(detection.get("entity_type", "")),
         confidence=float(detection.get("confidence", 1.0)),
     )
+
+
+def _snap_entity_to_grid(entity: EntityState, candidate_tiles: set[tuple[int, int]]) -> EntityState:
+    if not candidate_tiles:
+        return entity
+    best_tile = min(candidate_tiles, key=lambda tile: abs(tile[0] - entity.tile[0]) + abs(tile[1] - entity.tile[1]))
+    if abs(best_tile[0] - entity.tile[0]) + abs(best_tile[1] - entity.tile[1]) <= 1:
+        return replace(entity, tile=best_tile)
+    return entity
 
 
 def _first_tile(grid: np.ndarray, code: int) -> tuple[int, int] | None:

@@ -84,6 +84,17 @@ entity.confidence  # CNN heatmap 置信度
 玩家/怪物动态实体: tile + pixel center + bbox
 ```
 
+训练和评估显式覆盖 6 种颜色/亮度变体：
+
+```text
+default        原始 RGB 图像
+grayscale      灰度图复制为 3 通道 RGB
+dark           整体变暗
+bright         整体变亮
+high_contrast  灰度阈值二值化后的高对比图
+inverted       RGB 反色
+```
+
 ## 文件约定
 
 ```text
@@ -123,6 +134,7 @@ cd /home/VIG/data2/dangyunkai/wuhaoyi/Mathematical-Logic
 /home/VIG/data2/conda_envs/ml/bin/python -m nesylink.perception.cnn eval \
   --data nesylink/perception/data/perception_dataset.npz \
   --weights nesylink/perception/perception_model.pt \
+  --variant all \
   --device cpu
 ```
 
@@ -159,13 +171,15 @@ cd /home/VIG/data2/dangyunkai/wuhaoyi/Mathematical-Logic
 
 ## 当前权重指标
 
-当前 `perception_model.pt` 在 `perception_dataset.npz` 上的评估结果：
+当前 `perception_model.pt` 在 `perception_dataset.npz` 上对所有支持变体的评估结果：
 
 ```text
-val_loss: 0.006514
-tile_acc: 0.999807
-player_center_error_px: 1.129
-monster_tile_recall: 0.993506
+default        tile_acc=0.999797  player_err=1.167px  monster_recall=0.992641
+grayscale      tile_acc=0.999755  player_err=1.141px  monster_recall=0.993074
+dark           tile_acc=0.999766  player_err=1.135px  monster_recall=0.993506
+bright         tile_acc=0.999771  player_err=1.175px  monster_recall=0.993074
+high_contrast  tile_acc=0.999661  player_err=1.113px  monster_recall=0.996104
+inverted       tile_acc=0.999661  player_err=1.266px  monster_recall=0.995238
 ```
 
 单帧 CPU 推理耗时：
