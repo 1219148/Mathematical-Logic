@@ -31,14 +31,16 @@ def task1_room : RoomLayout := {
 
 def task1_init : SymbolicState := {
   player       := (4, 6),
+  facing       := Direction.down,
   health       := 5,
   keys         := 0,
   gold         := 0,
   items        := [],
   monsters     := [],
   monsterTypes := [],
-  chests       := [(0, 3)],
+  chests       := [{ pos := (0, 3), opened := false : ChestInfo }],
   buttons      := [],
+  shieldActive := false,
   room         := task1_room
 }
 

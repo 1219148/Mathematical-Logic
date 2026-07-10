@@ -94,6 +94,7 @@ def task3_roomMap : List (String × RoomLayout) := [
 -- 初始状态 = 起点房间
 def task3_init : SymbolicState := {
   player       := (4, 4),
+  facing       := Direction.down,
   health       := 5,
   keys         := 0,
   gold         := 0,
@@ -102,6 +103,8 @@ def task3_init : SymbolicState := {
   monsterTypes := [],
   chests       := [],
   buttons      := [],
+  shieldActive := false,
+  roomMap      := task3_roomMap,
   room         := task3_startLayout
 }
 

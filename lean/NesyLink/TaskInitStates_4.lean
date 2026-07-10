@@ -212,6 +212,7 @@ def task4_roomMap : List (String × RoomLayout) := [
 -- 初始状态：西房开局，自带盾牌
 def task4_init : SymbolicState := {
   player       := (7, 4),
+  facing       := Direction.right,
   health       := 5,
   keys         := 0,
   gold         := 0,
@@ -221,7 +222,9 @@ def task4_init : SymbolicState := {
   chests       := [],
   hiddenChests := [],
   buttons      := [],
+  shieldActive := false,
   dynamicStates := [("center_bridge", "west_to_north")],
+  roomMap      := task4_roomMap,
   room         := task4_westLayout
 }
 

@@ -14,6 +14,11 @@ inductive Action where
   | buttonB    -- 举盾
   deriving DecidableEq, Repr
 
+-- 朝向
+inductive Direction where
+  | up | down | left | right
+  deriving DecidableEq, Repr
+
 -- 怪物类型
 inductive MonsterType where
   | chaser
@@ -21,10 +26,23 @@ inductive MonsterType where
   | patroller
   deriving DecidableEq, Repr
 
+-- 怪物信息
+structure MonsterInfo where
+  damage : Nat
+  hp : Nat
+  pos : Position
+  monsterType : MonsterType
+  deriving DecidableEq, Repr
+
 -- 陷阱类型
 inductive TrapType where
   | normal
   | abyss
+  deriving DecidableEq, Repr
+
+structure ChestInfo where
+  pos : Position
+  opened : Bool
   deriving DecidableEq, Repr
 
 -- 出口类型
@@ -117,21 +135,108 @@ structure RoomLayout where
 -- 游戏状态 —— 随每一步变化的动态数据
 structure SymbolicState where
   player       : Position
+  facing       : Direction
   health       : Nat
   keys         : Nat
   gold         : Nat
   items        : List String
-  monsters     : List Position
+  monsters     : List MonsterInfo
   monsterTypes : List (Position × MonsterType)
-  chests       : List Position
+  chests       : List ChestInfo
   hiddenChests : List Position := []
   buttons      : List String := []
   dynamicStates : List (String × String) := []
-  room         : RoomLayout
+  exitOpened    : List Position := []
+  shieldActive  : Bool := false
+  roomMap       : List (String × RoomLayout) := []
+  room          : RoomLayout
   deriving DecidableEq, Repr
 
 def inBounds (p : Position) : Prop :=
   p.1 < 10 ∧ p.2 < 8
+
+-- 朝向对应的前方格子
+def frontOf (p : Position) (dir : Direction) : Position :=
+  match dir with
+  | Direction.up    => (p.1, if p.2 = 0 then 0 else p.2 - 1)
+  | Direction.down  => (p.1, p.2 + 1)
+  | Direction.left  => (if p.1 = 0 then 0 else p.1 - 1, p.2)
+  | Direction.right => (p.1 + 1, p.2)
+
+-- 从 List MonsterInfo / List ChestInfo 提取所有位置
+def monsterPositions (monsters : List MonsterInfo) : List Position :=
+  monsters.map (fun m => m.pos)
+
+def chestPositions (chests : List ChestInfo) : List Position :=
+  chests.map (fun c => c.pos)
+
+-- 宝箱是否处于打开状态
+def isChestOpened (chests : List ChestInfo) (p : Position) : Bool :=
+  (chests.find? (fun c => c.pos = p)).any (fun c => c.opened)
+
+-- 更新指定位置的宝箱为已打开
+def openChestAt (chests : List ChestInfo) (p : Position) : List ChestInfo :=
+  chests.map (fun c => if c.pos = p then { c with opened := true } else c)
+
+-- 出口相关辅助
+def dirToAction (dir : ExitDirection) : Action :=
+  match dir with
+  | ExitDirection.north => Action.up
+  | ExitDirection.south => Action.down
+  | ExitDirection.west => Action.left
+  | ExitDirection.east => Action.right
+
+def markExitOpened (exitOpened : List Position) (p : Position) : List Position :=
+  p :: exitOpened
+
+def isExitOpen (exitInfos : List ExitInfo) (exitOpened : List Position) (p : Position) : Bool :=
+  match exitInfos.find? (fun e => e.pos = p) with
+  | none => false
+  | some e => e.exitType = ExitType.normal || p ∈ exitOpened
+
+-- 从 roomMap 查找房间
+def lookupRoom (roomMap : List (String × RoomLayout)) (roomId : String) : Option RoomLayout :=
+  match roomMap.find? (fun (id, _) => id = roomId) with
+  | none => none
+  | some (_, layout) => some layout
+
+-- 查找目标房间的出生点坐标
+def lookupSpawn (roomMap : List (String × RoomLayout)) (roomId : String) (entryName : String) : Position :=
+  match lookupRoom roomMap roomId with
+  | none => (0, 0)
+  | some layout =>
+    match layout.spawns.find? (fun (name, _) => name = entryName) with
+    | some (_, pos) => pos
+    | none =>
+      match layout.spawns.find? (fun (name, _) => name = layout.defaultSpawn) with
+      | some (_, pos) => pos
+      | none => (0, 0)
+
+-- 从 RoomLayout 初始化房间动态状态
+def initChestsFromRoom (layout : RoomLayout) : List ChestInfo :=
+  layout.initialChests.map (fun p => { pos := p, opened := false : ChestInfo })
+
+def initMonstersFromRoom (layout : RoomLayout) : List MonsterInfo :=
+  layout.initialMonsterTypes.map (fun (pos, mtype) =>
+    { pos := pos, hp := 3, damage := 1, monsterType := mtype : MonsterInfo })
+
+def initButtonsFromRoom (layout : RoomLayout) : List String :=
+  layout.initialButtons.map (fun (id, _) => id)
+
+-- 构建 roomTransition 后的新状态
+def transitionResult (s : SymbolicState) (targetLayout : RoomLayout) (spawnPos : Position) : SymbolicState :=
+  { s with
+      player := spawnPos
+      facing := Direction.down
+      monsters := initMonstersFromRoom targetLayout
+      monsterTypes := targetLayout.initialMonsterTypes
+      chests := initChestsFromRoom targetLayout
+      hiddenChests := targetLayout.hiddenChests
+      buttons := initButtonsFromRoom targetLayout
+      exitOpened := []
+      shieldActive := false
+      room := targetLayout
+  }
 
 def manhattan (a b : Position) : Nat :=
   let dx := if a.1 ≤ b.1 then b.1 - a.1 else a.1 - b.1
@@ -140,6 +245,10 @@ def manhattan (a b : Position) : Nat :=
 
 def adjacent (a b : Position) : Prop :=
   manhattan a b = 1
+
+-- 玩家能交互的距离：同一格或相邻（曼哈顿距离 ≤ 1）
+def withinReach (a b : Position) : Prop :=
+  manhattan a b ≤ 1
 
 -- 整个 10×8 房间的所有瓦片坐标
 def allRoomTiles : List Position :=
@@ -174,19 +283,92 @@ def isWalkable (s : SymbolicState) (p : Position) : Prop :=
 
 -- 安全条件：可通行 ∧ （在桥上 ∨ 不在陷阱上） ∧ 不在怪物上
 def isSafe (s : SymbolicState) (p : Position) : Prop :=
-  isWalkable s p ∧ (p ∈ bridgeTiles s ∨ p ∉ trapPositions s) ∧ p ∉ s.monsters
+  isWalkable s p ∧ (p ∈ bridgeTiles s ∨ p ∉ trapPositions s) ∧ p ∉ monsterPositions s.monsters
 
 inductive Step : SymbolicState → Action → SymbolicState → Prop where
   -- TODO: 实现所有状态转移规则
   | wait (s : SymbolicState) : Step s Action.wait s
-  -- | moveUp ...
-  -- | attackMonster ...
-  -- | openChest ...
-  -- | openDoor ...
-  -- | stepOnTrap ...
-  -- | pressButton ...
-  -- | roomTransition ...
-  deriving DecidableEq
+  | moveUp (s : SymbolicState) : Step s Action.up { s with player := (s.player.1, s.player.2 - 1), facing := Direction.up, shieldActive := false }
+  | moveDown (s : SymbolicState) : Step s Action.down { s with player := (s.player.1, s.player.2 + 1), facing := Direction.down, shieldActive := false }
+  | moveLeft (s : SymbolicState) : Step s Action.left { s with player := (s.player.1 - 1, s.player.2), facing := Direction.left, shieldActive := false }
+  | moveRight (s : SymbolicState) : Step s Action.right { s with player := (s.player.1 + 1, s.player.2), facing := Direction.right, shieldActive := false }
+  | attackMonsterHit (s : SymbolicState) (m : MonsterInfo) :
+      m ∈ s.monsters →
+      m.pos = frontOf s.player s.facing →
+      m.hp > 1 →
+      Step s Action.buttonA
+        { s with
+            monsters := s.monsters.map (fun m' => if m'.pos = m.pos then { m' with hp := m'.hp - 1 } else m')
+            shieldActive := false
+        }
+  | attackMonsterKill (s : SymbolicState) (m : MonsterInfo) :
+      m ∈ s.monsters →
+      m.pos = frontOf s.player s.facing →
+      m.hp = 1 →
+      Step s Action.buttonA
+        { s with
+            monsters := s.monsters.filter (fun m' => m'.pos ≠ m.pos)
+            gold := s.gold + 2
+            shieldActive := false
+        }
+  | defense (s : SymbolicState) :
+      "shield" ∈ s.items →
+      Step s Action.buttonB
+        { s with shieldActive := true }
+  | openChest (s : SymbolicState) (c : ChestInfo) :
+      c ∈ s.chests →
+      withinReach c.pos s.player →
+      c.opened = false →
+      Step s Action.buttonA
+        { s with chests := openChestAt s.chests s.player, shieldActive := false }
+  -- 走到出口上 → 自动判断类型 → 切换房间
+  | roomTransitionNormal (s : SymbolicState) (e : ExitInfo) (targetLayout : RoomLayout) :
+      e ∈ s.room.exitInfos →
+      e.exitType = ExitType.normal →
+      s.player = e.pos →
+      lookupRoom s.roomMap e.targetRoomId = some targetLayout →
+      Step s (dirToAction e.direction)
+        (transitionResult s targetLayout (lookupSpawn s.roomMap e.targetRoomId e.targetEntry))
+  | roomTransitionLockedOpen (s : SymbolicState) (e : ExitInfo) (targetLayout : RoomLayout) :
+      e ∈ s.room.exitInfos →
+      e.exitType = ExitType.lockedKey →
+      s.player = e.pos →
+      e.pos ∈ s.exitOpened →
+      lookupRoom s.roomMap e.targetRoomId = some targetLayout →
+      Step s (dirToAction e.direction)
+        (transitionResult s targetLayout (lookupSpawn s.roomMap e.targetRoomId e.targetEntry))
+  | roomTransitionLockedUnlock (s : SymbolicState) (e : ExitInfo) (targetLayout : RoomLayout) :
+      e ∈ s.room.exitInfos →
+      e.exitType = ExitType.lockedKey →
+      s.player = e.pos →
+      (e.pos ∉ s.exitOpened) →
+      s.keys ≥ (e.requires.keyCount.getD 1) →
+      lookupRoom s.roomMap e.targetRoomId = some targetLayout →
+      Step s (dirToAction e.direction)
+        (transitionResult
+          { s with
+              keys := if e.requires.consumeKey then s.keys - (e.requires.keyCount.getD 1) else s.keys
+              exitOpened := markExitOpened s.exitOpened e.pos
+          }
+          targetLayout
+          (lookupSpawn s.roomMap e.targetRoomId e.targetEntry))
+  | roomTransitionConditional (s : SymbolicState) (e : ExitInfo) (targetLayout : RoomLayout) :
+      e ∈ s.room.exitInfos →
+      e.exitType = ExitType.conditional →
+      s.player = e.pos →
+      (e.requires.keyCount.all (fun n => s.keys ≥ n)) →
+      (e.requires.buttonId.all (fun id => id ∈ s.buttons)) →
+      (e.requires.requiredItem.all (fun item => item ∈ s.items)) →
+      (e.requires.allMonstersDefeated → s.monsters = []) →
+      lookupRoom s.roomMap e.targetRoomId = some targetLayout →
+      Step s (dirToAction e.direction)
+        (transitionResult
+          { s with
+              keys := if e.requires.consumeKey then s.keys - (e.requires.keyCount.getD 1) else s.keys
+              exitOpened := markExitOpened s.exitOpened e.pos
+          }
+          targetLayout
+          (lookupSpawn s.roomMap e.targetRoomId e.targetEntry))
 
 -- TODO: theorem moveInBounds : ...
 -- TODO: theorem neverEnterWall : ...

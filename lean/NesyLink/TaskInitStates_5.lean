@@ -137,14 +137,17 @@ def task5_roomMap : List (String × RoomLayout) := [
 -- 初始状态：room_0_0 起点(1,1)，场内一只 chaser 和一个宝箱
 def task5_init : SymbolicState := {
   player       := (1, 1),
+  facing       := Direction.down,
   health       := 5,
   keys         := 0,
   gold         := 0,
   items        := [],
-  monsters     := [(7, 4)],
+  monsters     := [{ damage := 1, hp := 3, pos := (7, 4), monsterType := MonsterType.chaser : MonsterInfo }],
   monsterTypes := [((7, 4), MonsterType.chaser)],
-  chests       := [(4, 2)],
+  chests       := [{ pos := (4, 2), opened := false : ChestInfo }],
   buttons      := [],
+  shieldActive := false,
+  roomMap      := task5_roomMap,
   room         := task5_room00Layout
 }
 
