@@ -103,7 +103,7 @@ def task3_init : SymbolicState := {
   monsterTypes := [],
   chests       := [],
   buttons      := [],
-  shieldActive := false,
+  shieldTicks := 0,
   roomMap      := task3_roomMap,
   room         := task3_startLayout
 }

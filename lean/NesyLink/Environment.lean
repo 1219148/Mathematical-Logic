@@ -36,7 +36,7 @@ structure MonsterInfo where
 
 -- 陷阱类型
 inductive TrapType where
-  | normal
+  | spike
   | abyss
   deriving DecidableEq, Repr
 
@@ -85,7 +85,7 @@ structure TrapInfo where
   pos       : Position
   damage    : Nat
   respawnTo : String
-  trapType  : TrapType := TrapType.normal
+  trapType  : TrapType := TrapType.spike
   area      : List Position := []
   deriving DecidableEq, Repr
 
@@ -147,7 +147,7 @@ structure SymbolicState where
   buttons      : List String := []
   dynamicStates : List (String × String) := []
   exitOpened    : List Position := []
-  shieldActive  : Bool := false
+  shieldTicks  : Nat := 0
   roomMap       : List (String × RoomLayout) := []
   room          : RoomLayout
   deriving DecidableEq, Repr
@@ -234,9 +234,18 @@ def transitionResult (s : SymbolicState) (targetLayout : RoomLayout) (spawnPos :
       hiddenChests := targetLayout.hiddenChests
       buttons := initButtonsFromRoom targetLayout
       exitOpened := []
-      shieldActive := false
+      shieldTicks := 0
       room := targetLayout
   }
+
+-- 在当前房间中按名字查找出生点坐标（陷阱重生用）
+def lookupRoomSpawn (room : RoomLayout) (entryName : String) : Position :=
+  match room.spawns.find? (fun (name, _) => name = entryName) with
+  | some (_, pos) => pos
+  | none =>
+    match room.spawns.find? (fun (name, _) => name = room.defaultSpawn) with
+    | some (_, pos) => pos
+    | none => (0, 0)
 
 def manhattan (a b : Position) : Nat :=
   let dx := if a.1 ≤ b.1 then b.1 - a.1 else a.1 - b.1
@@ -287,11 +296,11 @@ def isSafe (s : SymbolicState) (p : Position) : Prop :=
 
 inductive Step : SymbolicState → Action → SymbolicState → Prop where
   -- TODO: 实现所有状态转移规则
-  | wait (s : SymbolicState) : Step s Action.wait s
-  | moveUp (s : SymbolicState) : Step s Action.up { s with player := (s.player.1, s.player.2 - 1), facing := Direction.up, shieldActive := false }
-  | moveDown (s : SymbolicState) : Step s Action.down { s with player := (s.player.1, s.player.2 + 1), facing := Direction.down, shieldActive := false }
-  | moveLeft (s : SymbolicState) : Step s Action.left { s with player := (s.player.1 - 1, s.player.2), facing := Direction.left, shieldActive := false }
-  | moveRight (s : SymbolicState) : Step s Action.right { s with player := (s.player.1 + 1, s.player.2), facing := Direction.right, shieldActive := false }
+  | wait (s : SymbolicState) : Step s Action.wait { s with shieldTicks := (if s.shieldTicks > 0 then s.shieldTicks - 1 else 0) }
+  | moveUp (s : SymbolicState) : Step s Action.up { s with player := (s.player.1, s.player.2 - 1), facing := Direction.up, shieldTicks := 0 }
+  | moveDown (s : SymbolicState) : Step s Action.down { s with player := (s.player.1, s.player.2 + 1), facing := Direction.down, shieldTicks := 0 }
+  | moveLeft (s : SymbolicState) : Step s Action.left { s with player := (s.player.1 - 1, s.player.2), facing := Direction.left, shieldTicks := 0 }
+  | moveRight (s : SymbolicState) : Step s Action.right { s with player := (s.player.1 + 1, s.player.2), facing := Direction.right, shieldTicks := 0 }
   | attackMonsterHit (s : SymbolicState) (m : MonsterInfo) :
       m ∈ s.monsters →
       m.pos = frontOf s.player s.facing →
@@ -299,7 +308,7 @@ inductive Step : SymbolicState → Action → SymbolicState → Prop where
       Step s Action.buttonA
         { s with
             monsters := s.monsters.map (fun m' => if m'.pos = m.pos then { m' with hp := m'.hp - 1 } else m')
-            shieldActive := false
+            shieldTicks := 0
         }
   | attackMonsterKill (s : SymbolicState) (m : MonsterInfo) :
       m ∈ s.monsters →
@@ -309,19 +318,72 @@ inductive Step : SymbolicState → Action → SymbolicState → Prop where
         { s with
             monsters := s.monsters.filter (fun m' => m'.pos ≠ m.pos)
             gold := s.gold + 2
-            shieldActive := false
+            shieldTicks := 0
         }
   | defense (s : SymbolicState) :
       "shield" ∈ s.items →
       Step s Action.buttonB
-        { s with shieldActive := true }
+        { s with shieldTicks := 6 }
   | openChest (s : SymbolicState) (c : ChestInfo) :
       c ∈ s.chests →
       withinReach c.pos s.player →
       c.opened = false →
       Step s Action.buttonA
-        { s with chests := openChestAt s.chests s.player, shieldActive := false }
-  -- 走到出口上 → 自动判断类型 → 切换房间
+        { s with chests := openChestAt s.chests c.pos, gold := s.gold + 2, shieldTicks := 0 }
+  -- 怪物接触伤害（无盾）：玩家扣血
+  | monsterDamage (s : SymbolicState) (m : MonsterInfo) :
+      m ∈ s.monsters →
+      withinReach m.pos s.player →
+      s.shieldTicks = 0 →
+      s.health > 0 →
+      Step s Action.wait
+        { s with health := s.health - m.damage }
+  -- 怪物接触伤害（有盾格挡）：无伤，盾自然衰减 1 步
+  | monsterDamageBlocked (s : SymbolicState) (m : MonsterInfo) :
+      m ∈ s.monsters →
+      withinReach m.pos s.player →
+      s.shieldTicks > 0 →
+      Step s Action.wait
+        { s with shieldTicks := s.shieldTicks - 1 }
+  -- 钉刺陷阱：伤害 + 立即传送回出生点
+  | stepOnSpike (s : SymbolicState) (t : TrapInfo) :
+      t ∈ s.room.traps →
+      s.player ∈ (t.pos :: t.area) →
+      t.trapType = TrapType.spike →
+      s.health > 0 →
+      Step s Action.wait
+        { s with
+            health := s.health - t.damage
+            player := lookupRoomSpawn s.room t.respawnTo
+            shieldTicks := 0
+        }
+  -- 深渊陷阱：伤害 + 传送回出生点（Python 有控制锁延迟 + 智能选重生格，此处简化）
+  | stepOnAbyss (s : SymbolicState) (t : TrapInfo) :
+      t ∈ s.room.traps →
+      s.player ∈ (t.pos :: t.area) →
+      t.trapType = TrapType.abyss →
+      s.health > 0 →
+      Step s Action.wait
+        { s with
+            health := s.health - t.damage
+            player := lookupRoomSpawn s.room t.respawnTo
+            shieldTicks := 0
+        }
+  -- 按按钮（用于激活 conditional 出口条件）
+  | pressButton (s : SymbolicState) (buttonId : String) (pos : Position) :
+      (buttonId, pos) ∈ s.room.initialButtons →
+      withinReach pos s.player →
+      buttonId ∉ s.buttons →
+      Step s Action.buttonA
+        { s with buttons := buttonId :: s.buttons, shieldTicks := 0 }
+  -- 挥剑落空（前方无怪物且无宝箱/按钮可交互时）
+  | swordMiss (s : SymbolicState) :
+      (∀ m ∈ s.monsters, m.pos ≠ frontOf s.player s.facing) →
+      (∀ c ∈ s.chests, ¬ (withinReach c.pos s.player ∧ c.opened = false)) →
+      (∀ p ∈ s.room.initialButtons, ¬ (withinReach p.2 s.player ∧ p.1 ∉ s.buttons)) →
+      Step s Action.buttonA
+        { s with shieldTicks := 0 }
+    -- 走到出口上 → 自动判断类型 → 切换房间
   | roomTransitionNormal (s : SymbolicState) (e : ExitInfo) (targetLayout : RoomLayout) :
       e ∈ s.room.exitInfos →
       e.exitType = ExitType.normal →

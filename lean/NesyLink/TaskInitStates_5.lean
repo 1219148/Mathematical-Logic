@@ -146,7 +146,7 @@ def task5_init : SymbolicState := {
   monsterTypes := [((7, 4), MonsterType.chaser)],
   chests       := [{ pos := (4, 2), opened := false : ChestInfo }],
   buttons      := [],
-  shieldActive := false,
+  shieldTicks := 0,
   roomMap      := task5_roomMap,
   room         := task5_room00Layout
 }

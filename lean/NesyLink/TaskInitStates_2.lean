@@ -45,7 +45,7 @@ def task2_init : SymbolicState := {
   monsterTypes := [((2, 2), MonsterType.chaser)],
   chests       := [{ pos := (1, 3), opened := false : ChestInfo }],
   buttons      := [],
-  shieldActive := false,
+  shieldTicks := 0,
   room         := task2_room
 }
 
