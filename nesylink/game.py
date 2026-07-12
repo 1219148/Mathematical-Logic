@@ -4,15 +4,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-
-try:
-    import pygame
-except ModuleNotFoundError as exc:
-    raise ModuleNotFoundError(
-        "pygame is required for nesylink.game. Install it with `python -m pip install -e '.[pygame]'`. "
-        "If pip fails with an SSL certificate error on macOS, fix the Python certificate chain first or use "
-        "`python -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org pygame`."
-    ) from exc
+import pygame
 
 from .core.constants import TARGET_FPS, WINDOW_HEIGHT, WINDOW_WIDTH
 from .core.input import HumanInputState

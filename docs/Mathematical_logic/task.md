@@ -49,6 +49,8 @@ python utils/evaluate_policy.py \
   --num-envs 10
 ```
 
+完整参数、提交 agent 接口、JSON 输出和鲁棒性渲染方法说明见 [测评脚本说明](evaluation.md)。
+
 ## 动作空间、观测空间和信息结构
 
 > 本次数理逻辑任务默认使用 `observation_mode="pixels"`。所以 agent 的输入 `obs` 只能是 raw pixels 🥲

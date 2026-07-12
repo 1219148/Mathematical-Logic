@@ -33,12 +33,6 @@ pip install -e ".[pygame]"   # 人类游玩 / 调试入口
 pip install -e ".[dreamer]"  # Dreamer 风格图像处理依赖
 ```
 
-如果在 macOS 上遇到 SSL 证书验证失败，请先修复 Python 的证书链，再重试上面的命令。临时绕过时可以执行：
-
-```bash
-python -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org pygame
-```
-
 ## 快速开始
 
 通过 Gymnasium 注册 ID 创建环境：

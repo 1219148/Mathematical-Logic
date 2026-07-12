@@ -17,7 +17,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = []
 pygame = ["pygame>=2.5"]
-video = ["imageio[ffmpeg]>=2.34"]
 dreamer = ["pillow>=10"]
 
 [tool.setuptools.packages.find]

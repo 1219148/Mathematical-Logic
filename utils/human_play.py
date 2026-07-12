@@ -18,15 +18,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
-
-try:
-    import pygame
-except ModuleNotFoundError as exc:
-    raise ModuleNotFoundError(
-        "pygame is required for utils/human_play.py. Install it with `python -m pip install -e '.[pygame]'`. "
-        "If pip fails with an SSL certificate error on macOS, fix the Python certificate chain first or use "
-        "`python -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org pygame`."
-    ) from exc
+import pygame
 
 # Ensure project root is on sys.path so `import nesylink` works when running directly.
 _project_root = str(Path(__file__).resolve().parent.parent)
