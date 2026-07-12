@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from heapq import heappop, heappush
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterable
 
 from nesylink.core.observation import TILE_NPC
@@ -182,7 +182,7 @@ def blocked_tiles(
     extra_unblocked: set[Position] | None = None,
 ) -> set[Position]:
     blocked = set(state.walls) | npc_tiles(state) | set(state.traps) | set(state.gaps) | set(state.chests) | set(state.monsters)
-    if state.bridges:
+    if bridge_requires_constrained_walk(state):
         safe_tiles = set(state.bridges) | set(state.exits) | {state.player}
         blocked.update(
             (x, y)
@@ -195,6 +195,31 @@ def blocked_tiles(
     if extra_unblocked:
         blocked.difference_update(extra_unblocked)
     return blocked
+
+
+def bridge_requires_constrained_walk(state: SymbolicState) -> bool:
+    if not state.bridges:
+        return False
+    if any(neighbor in state.gaps for bridge in state.bridges for neighbor in neighbors(bridge)):
+        return True
+    return len(bridge_exit_sides(state)) >= 2
+
+
+def bridge_exit_sides(state: SymbolicState) -> frozenset[Side]:
+    sides: set[Side] = set()
+    for bridge in state.bridges:
+        for exit_tile in state.exits:
+            if manhattan(bridge, exit_tile) != 1:
+                continue
+            if exit_tile[1] == 0:
+                sides.add("up")
+            elif exit_tile[1] == 7:
+                sides.add("down")
+            elif exit_tile[0] == 0:
+                sides.add("left")
+            elif exit_tile[0] == 9:
+                sides.add("right")
+    return frozenset(sides)
 
 
 def npc_tiles(state: SymbolicState) -> set[Position]:
@@ -571,6 +596,7 @@ class Policy:
         self.current_room_signature: str | None = None
         self.attempted_exit: tuple[str, Side] | None = None
         self.last_player_tile: Position | None = None
+        self.last_reliable_player_tile: Position | None = None
         self.stuck_ticks = 0
         self.shield_cooldown = 0
 
@@ -596,12 +622,13 @@ class Policy:
         self.current_room_signature = None
         self.attempted_exit = None
         self.last_player_tile = None
+        self.last_reliable_player_tile = None
         self.stuck_ticks = 0
         self.shield_cooldown = 0
 
     def act(self, obs, info) -> int:
         if self.committed_action is not None and self.committed_ticks_remaining > 0:
-            state = self.perception_engine.extract(obs)
+            state = self._extract_state(obs)
             if self._committed_move_complete(state):
                 pass
             elif self._stuck_recovery_action(state):
@@ -631,7 +658,7 @@ class Policy:
                 self._clear_commit()
             return action
 
-        state = self.perception_engine.extract(obs)
+        state = self._extract_state(obs)
         self._update_stuck_counter(state)
         features = room_features(state)
         keys = inventory_keys(info)
@@ -765,9 +792,52 @@ class Policy:
         return self._return_to_center(state, features)
 
     def _symbolic_room_changed(self, obs) -> bool:
-        state = self.perception_engine.extract(obs)
+        state = self._extract_state(obs)
         room = self._room_signature(room_features(state))
         return room != "unknown" and self.last_room_signature is not None and room != self.last_room_signature
+
+    def _extract_state(self, obs) -> SymbolicState:
+        state = self.perception_engine.extract(obs)
+        return self._stabilize_player_tile(state)
+
+    def _stabilize_player_tile(self, state: SymbolicState) -> SymbolicState:
+        entity = state.player_entity
+        if entity is None:
+            self.last_reliable_player_tile = state.player
+            return state
+
+        center_tile = (
+            int(entity.center_px[0] // 16),
+            int(entity.center_px[1] // 16),
+        )
+        if not self._valid_player_tile(center_tile, state):
+            self.last_reliable_player_tile = state.player
+            return state
+
+        player = center_tile
+        if entity.confidence < 0.5 and self._valid_player_tile(state.player, state):
+            player = state.player
+        elif state.player in self._current_room_blockers() and center_tile not in self._current_room_blockers():
+            player = center_tile
+        if (
+            self.last_reliable_player_tile is not None
+            and manhattan(player, self.last_reliable_player_tile) > 3
+            and manhattan(center_tile, self.last_reliable_player_tile) <= 3
+        ):
+            player = center_tile
+
+        self.last_reliable_player_tile = player
+        if player == state.player and entity.tile == player:
+            return state
+        return replace(state, player=player, player_entity=replace(entity, tile=player))
+
+    def _valid_player_tile(self, tile: Position, state: SymbolicState) -> bool:
+        return (
+            in_bounds(tile)
+            and tile not in state.walls
+            and tile not in state.traps
+            and tile not in state.gaps
+        )
 
     def _missing_player_hub_action(self, state: SymbolicState, keys: int, has_sword: bool) -> int | None:
         target_side = self._choose_target_side(state, keys, has_sword)
@@ -786,8 +856,6 @@ class Policy:
             pieces.append("switch")
         if features.has_button:
             pieces.append("button")
-        if features.has_chest:
-            pieces.append("chest")
         if features.has_monster:
             pieces.append("monster")
         return ",".join(pieces) if pieces else "unknown"
@@ -933,8 +1001,6 @@ class Policy:
             "exits=" + ",".join(sorted(features.exit_sides)),
             "walls=" + ",".join(f"{x}:{y}" for x, y in sorted(state.walls)),
             "npc=" + ",".join(f"{x}:{y}" for x, y in sorted(npc_tiles(state))),
-            "bridge=" + ",".join(f"{x}:{y}" for x, y in sorted(state.bridges)),
-            "gap=" + ",".join(f"{x}:{y}" for x, y in sorted(state.gaps)),
         ]
         return "|".join(pieces) if any(pieces) else "unknown"
 
@@ -977,11 +1043,12 @@ class Policy:
         keys: int,
         room_sig: str,
     ) -> Side | None:
-        candidates: list[tuple[float, int, Side]] = []
+        candidates: list[tuple[int, float, int, Side]] = []
         for order, side in enumerate(SIDE_ORDER):
             if side not in features.exit_sides:
                 continue
             memory = self.exit_memory.get((room_sig, side), ExitMemory())
+            priority = self._exit_objective_priority(memory, keys)
             score = 0.0
             if memory.status == "unknown":
                 score -= self.config.unknown_exit_bonus
@@ -1002,10 +1069,40 @@ class Policy:
             )
             path_weight = 0.0 if keys > 0 and memory.status in {"unknown", "blocked"} else 1.0
             score += path_weight * float(len(path) if path else 100)
-            candidates.append((score, order, side))
+            candidates.append((priority, score, order, side))
         if not candidates:
             return None
-        return min(candidates)[2]
+        return min(candidates)[3]
+
+    def _exit_objective_priority(self, memory: ExitMemory, keys: int) -> int:
+        if memory.status == "blocked" and keys > 0:
+            return 0
+        if memory.status == "open" and memory.leads_to is not None:
+            if self._room_has_unfinished_goal(memory.leads_to):
+                return 1
+            if self._room_has_unknown_frontier(memory.leads_to):
+                return 2
+            return 5
+        if memory.status == "unknown":
+            return 3
+        if memory.status == "blocked":
+            return 6
+        return 4
+
+    def _room_has_unfinished_goal(self, room_sig: str) -> bool:
+        room = self.room_memory.get(room_sig)
+        if room is None:
+            return True
+        return bool(room.known_chests - room.opened_chests)
+
+    def _room_has_unknown_frontier(self, room_sig: str) -> bool:
+        room = self.room_memory.get(room_sig)
+        if room is None:
+            return True
+        return any(
+            self.exit_memory.get((room_sig, side), ExitMemory()).status == "unknown"
+            for side in room.exits
+        )
 
     def _global_room_score(self, start_room: str) -> float:
         frontier: list[tuple[float, str]] = [(0.0, start_room)]
