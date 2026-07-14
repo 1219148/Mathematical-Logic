@@ -91,6 +91,7 @@ class PerceptionEngine:
             chests=frozenset(_all_tiles(grid, TILE_CHEST)),
             traps=frozenset(_all_tiles(grid, TILE_TRAP)),
             exits=frozenset(_all_tiles(grid, TILE_EXIT)),
+            exit_types=dict(prediction.get("exit_types", {})),
             buttons=frozenset(_all_tiles(grid, TILE_BUTTON)),
             gaps=frozenset(_all_tiles(grid, TILE_GAP)),
             bridges=frozenset(_all_tiles(grid, TILE_BRIDGE)),

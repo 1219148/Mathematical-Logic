@@ -45,6 +45,7 @@ state.monsters          # 怪物 tile 集合
 state.chests            # 宝箱 tile 集合
 state.traps             # 陷阱 tile 集合
 state.exits             # 出口 tile 集合
+state.exit_types        # 出口类型映射，例如 {(4, 0): "locked_key"}
 state.buttons           # 按钮 tile 集合
 state.gaps              # 缺口 tile 集合
 state.bridges           # 桥 tile 集合
@@ -72,9 +73,10 @@ entity.confidence  # CNN heatmap 置信度
 
 ## CNN 输出逻辑
 
-模型在 `cnn.py` 中，主体是 `TinyPerceptionCNN`。它有两个 head：
+模型在 `cnn.py` 中，主体是 `TinyPerceptionCNN`。它有三个 head：
 
 - `tile_head`：输出 `8 x 10` 语义图，负责墙、宝箱、出口、陷阱、按钮、桥、缺口等 tile 级信息。
+- `exit_type_head`：输出 `8 x 10` 出口类型图，负责区分 `normal`、`locked_key`、`conditional`。
 - `heatmap_head`：输出玩家/怪物的像素级中心点 heatmap，负责动态实体的精确位置。
 
 所以 perception 不是只返回 tile，也不是只返回 pixel，而是混合表示：
@@ -174,12 +176,12 @@ cd /home/VIG/data2/dangyunkai/wuhaoyi/Mathematical-Logic
 当前 `perception_model.pt` 在 `perception_dataset.npz` 上对所有支持变体的评估结果：
 
 ```text
-default        tile_acc=0.999797  player_err=1.167px  monster_recall=0.992641
-grayscale      tile_acc=0.999755  player_err=1.141px  monster_recall=0.993074
-dark           tile_acc=0.999766  player_err=1.135px  monster_recall=0.993506
-bright         tile_acc=0.999771  player_err=1.175px  monster_recall=0.993074
-high_contrast  tile_acc=0.999661  player_err=1.113px  monster_recall=0.996104
-inverted       tile_acc=0.999661  player_err=1.266px  monster_recall=0.995238
+default        tile_acc=0.999839  exit_type_acc=1.000000  player_err=1.081px  monster_recall=0.993639
+grayscale      tile_acc=0.999828  exit_type_acc=1.000000  player_err=1.070px  monster_recall=0.994487
+dark           tile_acc=0.999818  exit_type_acc=1.000000  player_err=1.072px  monster_recall=0.993639
+bright         tile_acc=0.999849  exit_type_acc=1.000000  player_err=1.078px  monster_recall=0.995759
+high_contrast  tile_acc=0.999839  exit_type_acc=1.000000  player_err=1.134px  monster_recall=0.993639
+inverted       tile_acc=0.999807  exit_type_acc=1.000000  player_err=1.177px  monster_recall=0.996607
 ```
 
 单帧 CPU 推理耗时：
@@ -206,7 +208,7 @@ export MKL_NUM_THREADS=16
 
 ## 注意事项
 
-- 当前 perception 重点解决地图语义、玩家位置、怪物位置。
+- 当前 perception 重点解决地图语义、出口类型、玩家位置、怪物位置。
 - `health`、`keys`、`gold`、`items` 目前没有从像素中恢复，`engine.extract` 中保守填默认值。
 - `monster_types` 当前填 `"unknown"`，如需区分 chaser/patroller/ambusher，需要给 CNN 增加怪物类型分类 head 或引入时序跟踪。
 - `static_grid` 字段名沿用现有接口，但内容是完整 CNN 语义图，里面也可能包含 player/monster 这类动态对象。

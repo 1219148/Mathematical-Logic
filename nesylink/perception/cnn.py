@@ -11,10 +11,13 @@ from typing import Any, Sequence
 import numpy as np
 
 from nesylink.core.constants import GRID_HEIGHT, GRID_WIDTH, MAP_PIXEL_HEIGHT, MAP_PIXEL_WIDTH, TILE_SIZE
-from nesylink.core.observation import TILE_MONSTER, TILE_PLAYER
+from nesylink.core.observation import TILE_EXIT, TILE_MONSTER, TILE_PLAYER
 
 
 NUM_TILE_CLASSES = 12
+EXIT_TYPE_NAMES = ("none", "normal", "locked_key", "conditional")
+EXIT_TYPE_TO_INDEX = {name: index for index, name in enumerate(EXIT_TYPE_NAMES)}
+NUM_EXIT_TYPE_CLASSES = len(EXIT_TYPE_NAMES)
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
 DEFAULT_DATASET = DEFAULT_DATA_DIR / "perception_dataset.npz"
 DEFAULT_WEIGHTS = Path(__file__).resolve().parent / "perception_model.pt"
@@ -67,7 +70,11 @@ class TinyPerceptionCNN(_BaseTorchModule()):
     训练时使用 info/structured obs 自动标注，推理时只输入 raw pixels。
     """
 
-    def __init__(self, num_classes: int = NUM_TILE_CLASSES) -> None:
+    def __init__(
+        self,
+        num_classes: int = NUM_TILE_CLASSES,
+        num_exit_type_classes: int = NUM_EXIT_TYPE_CLASSES,
+    ) -> None:
         torch, nn, _ = _torch_modules()
         super().__init__()
         self.encoder = nn.Sequential(
@@ -95,6 +102,12 @@ class TinyPerceptionCNN(_BaseTorchModule()):
             nn.ReLU(inplace=True),
             nn.Conv2d(96, num_classes, kernel_size=1),
         )
+        self.exit_type_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d((GRID_HEIGHT, GRID_WIDTH)),
+            nn.Conv2d(96, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, num_exit_type_classes, kernel_size=1),
+        )
         self.heatmap_head = nn.Sequential(
             nn.Conv2d(96, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -105,6 +118,7 @@ class TinyPerceptionCNN(_BaseTorchModule()):
     def forward(self, images: Any) -> dict[str, Any]:
         features = self.encoder(images)
         tile_logits = self.tile_head(features)
+        exit_type_logits = self.exit_type_head(features)
         heatmap_logits = self.heatmap_head(features)
         heatmap_logits = self._interpolate(
             heatmap_logits,
@@ -112,7 +126,11 @@ class TinyPerceptionCNN(_BaseTorchModule()):
             mode="bilinear",
             align_corners=False,
         )
-        return {"tile_logits": tile_logits, "heatmap_logits": heatmap_logits}
+        return {
+            "tile_logits": tile_logits,
+            "exit_type_logits": exit_type_logits,
+            "heatmap_logits": heatmap_logits,
+        }
 
 
 class PerceptionDataset(_BaseTorchDataset()):
@@ -130,6 +148,10 @@ class PerceptionDataset(_BaseTorchDataset()):
         data = np.load(dataset_path)
         self.images = data["images"][indices]
         self.grids = data["grids"][indices]
+        if "exit_type_grids" in data.files:
+            self.exit_type_grids = data["exit_type_grids"][indices]
+        else:
+            self.exit_type_grids = _fallback_exit_type_grids(self.grids)
         self.player_centers = data["player_centers"][indices]
         self.monster_centers = data["monster_centers"][indices]
         self.monster_masks = data["monster_masks"][indices]
@@ -153,6 +175,7 @@ class PerceptionDataset(_BaseTorchDataset()):
             image = _augment_image(image)
         image_tensor = self.torch.from_numpy(np.transpose(image, (2, 0, 1))).float()
         grid_tensor = self.torch.from_numpy(self.grids[sample_index].astype(np.int64))
+        exit_type_tensor = self.torch.from_numpy(self.exit_type_grids[sample_index].astype(np.int64))
         heatmap = _make_heatmaps(
             self.player_centers[sample_index],
             self.monster_centers[sample_index],
@@ -161,6 +184,7 @@ class PerceptionDataset(_BaseTorchDataset()):
         return {
             "image": image_tensor,
             "grid": grid_tensor,
+            "exit_type_grid": exit_type_tensor,
             "heatmap": self.torch.from_numpy(heatmap).float(),
         }
 
@@ -177,6 +201,7 @@ def collect_dataset(config: DatasetConfig) -> Path:
 
     images: list[np.ndarray] = []
     grids: list[np.ndarray] = []
+    exit_type_grids: list[np.ndarray] = []
     player_centers: list[np.ndarray] = []
     monster_centers: list[np.ndarray] = []
     monster_masks: list[np.ndarray] = []
@@ -188,6 +213,7 @@ def collect_dataset(config: DatasetConfig) -> Path:
         rng=rng,
         images=images,
         grids=grids,
+        exit_type_grids=exit_type_grids,
         player_centers=player_centers,
         monster_centers=monster_centers,
         monster_masks=monster_masks,
@@ -198,6 +224,7 @@ def collect_dataset(config: DatasetConfig) -> Path:
         rng=rng,
         images=images,
         grids=grids,
+        exit_type_grids=exit_type_grids,
         player_centers=player_centers,
         monster_centers=monster_centers,
         monster_masks=monster_masks,
@@ -209,6 +236,7 @@ def collect_dataset(config: DatasetConfig) -> Path:
         output,
         images=np.stack(images).astype(np.uint8),
         grids=np.stack(grids).astype(np.uint8),
+        exit_type_grids=np.stack(exit_type_grids).astype(np.uint8),
         player_centers=np.stack(player_centers).astype(np.float32),
         monster_centers=np.stack(monster_centers).astype(np.float32),
         monster_masks=np.stack(monster_masks).astype(np.bool_),
@@ -252,9 +280,17 @@ def train_model(
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     model = TinyPerceptionCNN().to(resolved_device)
+    _warm_start_model(model, weights_path, torch, resolved_device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     tile_weights = _tile_class_weights(data["grids"]).to(resolved_device)
+    exit_type_labels = (
+        data["exit_type_grids"]
+        if "exit_type_grids" in data.files
+        else _fallback_exit_type_grids(data["grids"])
+    )
+    exit_type_weights = _exit_type_class_weights(exit_type_labels).to(resolved_device)
     tile_loss_fn = nn.CrossEntropyLoss(weight=tile_weights)
+    exit_type_loss_fn = nn.CrossEntropyLoss(weight=exit_type_weights)
     heatmap_loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(12.0, device=resolved_device))
 
     best_val = float("inf")
@@ -268,11 +304,13 @@ def train_model(
         for batch in train_loader:
             images = batch["image"].to(resolved_device)
             grids = batch["grid"].to(resolved_device)
+            exit_type_grids = batch["exit_type_grid"].to(resolved_device)
             heatmaps = batch["heatmap"].to(resolved_device)
             output = model(images)
             tile_loss = tile_loss_fn(output["tile_logits"], grids)
+            exit_type_loss = exit_type_loss_fn(output["exit_type_logits"], exit_type_grids)
             heatmap_loss = heatmap_loss_fn(output["heatmap_logits"], heatmaps)
-            loss = tile_loss + 0.35 * heatmap_loss
+            loss = tile_loss + 0.30 * exit_type_loss + 0.35 * heatmap_loss
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -285,6 +323,7 @@ def train_model(
         print(
             f"epoch={epoch:02d} train_loss={metrics['train_loss']:.4f} "
             f"val_loss={metrics['val_loss']:.4f} tile_acc={metrics['tile_acc']:.4f} "
+            f"exit_type_acc={metrics['exit_type_acc']:.4f} "
             f"player_err={metrics['player_center_error_px']:.2f}px "
             f"monster_recall={metrics['monster_tile_recall']:.4f}",
             flush=True,
@@ -297,6 +336,8 @@ def train_model(
                 {
                     "state_dict": model.state_dict(),
                     "num_tile_classes": NUM_TILE_CLASSES,
+                    "num_exit_type_classes": NUM_EXIT_TYPE_CLASSES,
+                    "exit_type_names": EXIT_TYPE_NAMES,
                     "metrics": best_metrics,
                     "dataset": str(dataset_path),
                 },
@@ -312,11 +353,14 @@ def train_model(
 def evaluate_model(model: Any, loader: Any, *, device: Any) -> dict[str, float]:
     torch, nn, _ = _torch_modules()
     tile_loss_fn = nn.CrossEntropyLoss()
+    exit_type_loss_fn = nn.CrossEntropyLoss()
     heatmap_loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(12.0, device=device))
     model.eval()
     total_loss = 0.0
     total_tiles = 0
     correct_tiles = 0
+    exit_type_total = 0
+    correct_exit_types = 0
     player_errors: list[float] = []
     monster_hits = 0
     monster_total = 0
@@ -325,11 +369,17 @@ def evaluate_model(model: Any, loader: Any, *, device: Any) -> dict[str, float]:
         for batch in loader:
             images = batch["image"].to(device)
             grids = batch["grid"].to(device)
+            exit_type_grids = batch["exit_type_grid"].to(device)
             heatmaps = batch["heatmap"].to(device)
             output = model(images)
-            loss = tile_loss_fn(output["tile_logits"], grids) + 0.35 * heatmap_loss_fn(
-                output["heatmap_logits"],
-                heatmaps,
+            loss = (
+                tile_loss_fn(output["tile_logits"], grids)
+                + 0.30 * exit_type_loss_fn(output["exit_type_logits"], exit_type_grids)
+                + 0.35
+                * heatmap_loss_fn(
+                    output["heatmap_logits"],
+                    heatmaps,
+                )
             )
             total_loss += float(loss.cpu())
             batches += 1
@@ -337,6 +387,10 @@ def evaluate_model(model: Any, loader: Any, *, device: Any) -> dict[str, float]:
             pred_grid = output["tile_logits"].argmax(dim=1)
             correct_tiles += int((pred_grid == grids).sum().cpu())
             total_tiles += int(grids.numel())
+            pred_exit_type_grid = output["exit_type_logits"].argmax(dim=1)
+            exit_mask = exit_type_grids != EXIT_TYPE_TO_INDEX["none"]
+            correct_exit_types += int((pred_exit_type_grid[exit_mask] == exit_type_grids[exit_mask]).sum().cpu())
+            exit_type_total += int(exit_mask.sum().cpu())
 
             probs = torch.sigmoid(output["heatmap_logits"]).cpu().numpy()
             true_heatmaps = heatmaps.cpu().numpy()
@@ -361,6 +415,7 @@ def evaluate_model(model: Any, loader: Any, *, device: Any) -> dict[str, float]:
     return {
         "val_loss": total_loss / max(1, batches),
         "tile_acc": correct_tiles / max(1, total_tiles),
+        "exit_type_acc": correct_exit_types / max(1, exit_type_total),
         "player_center_error_px": float(np.mean(player_errors)) if player_errors else 0.0,
         "monster_tile_recall": monster_hits / max(1, monster_total),
     }
@@ -395,6 +450,18 @@ def _tile_class_weights(grids: np.ndarray) -> Any:
     return torch.from_numpy(weights.astype(np.float32))
 
 
+def _exit_type_class_weights(exit_type_grids: np.ndarray) -> Any:
+    torch, _, _ = _torch_modules()
+    counts = np.bincount(
+        exit_type_grids.reshape(-1).astype(np.int64),
+        minlength=NUM_EXIT_TYPE_CLASSES,
+    ).astype(np.float32)
+    counts += 1.0
+    weights = np.sqrt(counts.sum() / counts)
+    weights = weights / weights.mean()
+    return torch.from_numpy(weights.astype(np.float32))
+
+
 def load_model(weights_path: str | Path = DEFAULT_WEIGHTS, *, device: str | None = None) -> tuple[Any, Any]:
     torch, _, _ = _torch_modules()
     resolved_device = _resolve_device(torch, device)
@@ -403,11 +470,46 @@ def load_model(weights_path: str | Path = DEFAULT_WEIGHTS, *, device: str | None
     except TypeError:
         # 兼容旧版 PyTorch：旧版本 torch.load 还没有 weights_only 参数。
         checkpoint = torch.load(weights_path, map_location=resolved_device)
-    model = TinyPerceptionCNN(num_classes=int(checkpoint.get("num_tile_classes", NUM_TILE_CLASSES)))
-    model.load_state_dict(checkpoint["state_dict"])
+    model = TinyPerceptionCNN(
+        num_classes=int(checkpoint.get("num_tile_classes", NUM_TILE_CLASSES)),
+        num_exit_type_classes=int(checkpoint.get("num_exit_type_classes", NUM_EXIT_TYPE_CLASSES)),
+    )
+    incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    allowed_missing = {
+        name for name in incompatible.missing_keys if name.startswith("exit_type_head.")
+    }
+    unexpected = list(incompatible.unexpected_keys)
+    missing = [name for name in incompatible.missing_keys if name not in allowed_missing]
+    if unexpected or missing:
+        raise RuntimeError(
+            f"perception checkpoint incompatible: missing={missing}, unexpected={unexpected}"
+        )
     model.to(resolved_device)
     model.eval()
     return model, torch
+
+
+def _warm_start_model(model: Any, weights_path: Path, torch: Any, device: Any) -> None:
+    if not weights_path.exists():
+        return
+    try:
+        checkpoint = torch.load(weights_path, map_location=device, weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(weights_path, map_location=device)
+    state_dict = checkpoint.get("state_dict")
+    if not isinstance(state_dict, dict):
+        return
+
+    current_state = model.state_dict()
+    compatible_state = {
+        name: tensor
+        for name, tensor in state_dict.items()
+        if name in current_state and tuple(tensor.shape) == tuple(current_state[name].shape)
+    }
+    if not compatible_state:
+        return
+    model.load_state_dict(compatible_state, strict=False)
+    print(f"warm_start_params={len(compatible_state)}", flush=True)
 
 
 def predict_frame(
@@ -425,6 +527,10 @@ def predict_frame(
     with torch.no_grad():
         output = model(tensor)
         grid = output["tile_logits"].argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+        if "exit_type_logits" in output:
+            exit_type_grid = output["exit_type_logits"].argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+        else:
+            exit_type_grid = _fallback_exit_type_grids(grid[None, ...])[0]
         heatmaps = torch.sigmoid(output["heatmap_logits"])[0].cpu().numpy()
 
     player_conf = float(heatmaps[0].max())
@@ -453,7 +559,14 @@ def predict_frame(
                 }
             )
 
-    return {"grid": grid, "player": player, "monsters": tuple(monsters), "heatmaps": heatmaps}
+    return {
+        "grid": grid,
+        "exit_type_grid": exit_type_grid,
+        "exit_types": _exit_types_from_prediction(grid, exit_type_grid),
+        "player": player,
+        "monsters": tuple(monsters),
+        "heatmaps": heatmaps,
+    }
 
 
 def _collect_builtin_samples(
@@ -462,6 +575,7 @@ def _collect_builtin_samples(
     rng: random.Random,
     images: list[np.ndarray],
     grids: list[np.ndarray],
+    exit_type_grids: list[np.ndarray],
     player_centers: list[np.ndarray],
     monster_centers: list[np.ndarray],
     monster_masks: list[np.ndarray],
@@ -476,7 +590,17 @@ def _collect_builtin_samples(
         env = make_env(task_id=task_id, observation_mode="full", render_mode="rgb_array")
         label, _info = env.reset(seed=rng.randrange(10_000_000))
         for _ in range(per_task):
-            _append_sample(env, label, images, grids, player_centers, monster_centers, monster_masks, max_monsters)
+            _append_sample(
+                env,
+                label,
+                images,
+                grids,
+                exit_type_grids,
+                player_centers,
+                monster_centers,
+                monster_masks,
+                max_monsters,
+            )
             action = int(rng.randrange(env.action_space.n))
             label, _reward, terminated, truncated, _info = env.step(action)
             if terminated or truncated:
@@ -493,6 +617,7 @@ def _collect_random_room_samples(
     rng: random.Random,
     images: list[np.ndarray],
     grids: list[np.ndarray],
+    exit_type_grids: list[np.ndarray],
     player_centers: list[np.ndarray],
     monster_centers: list[np.ndarray],
     monster_masks: list[np.ndarray],
@@ -512,7 +637,17 @@ def _collect_random_room_samples(
         env = make_env(map_path=room_path, observation_mode="full", render_mode="rgb_array", max_monsters=max_monsters)
         label, _info = env.reset(seed=rng.randrange(10_000_000))
         for _ in range(rng.randint(3, 9)):
-            _append_sample(env, label, images, grids, player_centers, monster_centers, monster_masks, max_monsters)
+            _append_sample(
+                env,
+                label,
+                images,
+                grids,
+                exit_type_grids,
+                player_centers,
+                monster_centers,
+                monster_masks,
+                max_monsters,
+            )
             made += 1
             if made >= target_count:
                 break
@@ -528,6 +663,7 @@ def _append_sample(
     label: dict[str, np.ndarray],
     images: list[np.ndarray],
     grids: list[np.ndarray],
+    exit_type_grids: list[np.ndarray],
     player_centers: list[np.ndarray],
     monster_centers: list[np.ndarray],
     monster_masks: list[np.ndarray],
@@ -535,6 +671,7 @@ def _append_sample(
 ) -> None:
     frame = env.render()[:MAP_PIXEL_HEIGHT, :MAP_PIXEL_WIDTH].astype(np.uint8)
     grid = label["grid"].astype(np.uint8)
+    exit_type_grid = _exit_type_grid_from_env(env)
     player_center = np.asarray(label["player_position_px"], dtype=np.float32) + TILE_SIZE * 0.5
     centers = np.full((max_monsters, 2), -1.0, dtype=np.float32)
     masks = np.zeros((max_monsters,), dtype=np.bool_)
@@ -547,6 +684,7 @@ def _append_sample(
 
     images.append(frame)
     grids.append(grid)
+    exit_type_grids.append(exit_type_grid)
     player_centers.append(player_center)
     monster_centers.append(centers)
     monster_masks.append(masks)
@@ -557,7 +695,16 @@ def _random_room_payload(rng: random.Random) -> dict[str, Any]:
     spawn = (rng.randrange(1, GRID_WIDTH - 1), rng.randrange(1, GRID_HEIGHT - 1))
     occupied.add(spawn)
     layout: list[str] = []
-    exit_floor = {(4, 0), (5, 0), (4, GRID_HEIGHT - 1), (5, GRID_HEIGHT - 1), (0, 3), (0, 4), (GRID_WIDTH - 1, 3), (GRID_WIDTH - 1, 4)}
+    exit_floor = {
+        (4, 0),
+        (5, 0),
+        (4, GRID_HEIGHT - 1),
+        (5, GRID_HEIGHT - 1),
+        (0, 3),
+        (0, 4),
+        (GRID_WIDTH - 1, 3),
+        (GRID_WIDTH - 1, 4),
+    }
     for y in range(GRID_HEIGHT):
         row = []
         for x in range(GRID_WIDTH):
@@ -604,15 +751,19 @@ def _random_room_payload(rng: random.Random) -> dict[str, Any]:
     exits = []
     if rng.random() < 0.65:
         for direction in rng.sample(["north", "south", "west", "east"], rng.randint(1, 2)):
-            exits.append(
-                {
-                    "id": f"{direction}_exit",
-                    "direction": direction,
-                    "target_room": "random_room",
-                    "target_entry": "default",
-                    "type": "normal",
-                }
-            )
+            exit_type = rng.choice(["normal", "locked_key", "conditional"])
+            exit_payload = {
+                "id": f"{direction}_exit",
+                "direction": direction,
+                "target_room": "random_room",
+                "target_entry": "default",
+                "type": exit_type,
+            }
+            if exit_type == "locked_key":
+                exit_payload["requires"] = {"key_count": 1, "consume_key": False}
+            elif exit_type == "conditional":
+                exit_payload["requires"] = {"all_monsters_defeated": True}
+            exits.append(exit_payload)
 
     dynamic_objects = []
     if rng.random() < 0.55:
@@ -642,6 +793,38 @@ def _random_room_payload(rng: random.Random) -> dict[str, Any]:
         "dynamic_objects": dynamic_objects,
         "exits": exits,
     }
+
+
+def _exit_type_grid_from_env(env: Any) -> np.ndarray:
+    grid = np.zeros((GRID_HEIGHT, GRID_WIDTH), dtype=np.uint8)
+    room = env.engine.runtime.room
+    for exit_config in room.exits:
+        exit_type = str(getattr(exit_config, "exit_type", "normal")).lower()
+        type_index = EXIT_TYPE_TO_INDEX.get(exit_type, EXIT_TYPE_TO_INDEX["normal"])
+        for col, row in exit_config.tiles:
+            grid[row, col] = type_index
+    return grid
+
+
+def _fallback_exit_type_grids(grids: np.ndarray) -> np.ndarray:
+    exit_type_grids = np.zeros_like(grids, dtype=np.uint8)
+    exit_type_grids[np.asarray(grids) == TILE_EXIT] = EXIT_TYPE_TO_INDEX["normal"]
+    return exit_type_grids
+
+
+def _exit_types_from_prediction(
+    grid: np.ndarray,
+    exit_type_grid: np.ndarray,
+) -> dict[tuple[int, int], str]:
+    exit_types: dict[tuple[int, int], str] = {}
+    for row, col in np.argwhere(grid == TILE_EXIT):
+        type_index = int(exit_type_grid[row, col])
+        if type_index <= EXIT_TYPE_TO_INDEX["none"] or type_index >= len(EXIT_TYPE_NAMES):
+            exit_type = "normal"
+        else:
+            exit_type = EXIT_TYPE_NAMES[type_index]
+        exit_types[(int(col), int(row))] = exit_type
+    return exit_types
 
 
 def _make_heatmaps(
