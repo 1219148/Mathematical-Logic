@@ -73,10 +73,11 @@ entity.confidence  # CNN heatmap 置信度
 
 ## CNN 输出逻辑
 
-模型在 `cnn.py` 中，主体是 `TinyPerceptionCNN`。它有三个 head：
+模型在 `cnn.py` 中，主体是 `TinyPerceptionCNN`。它有四个 head：
 
 - `tile_head`：输出 `8 x 10` 语义图，负责墙、宝箱、出口、陷阱、按钮、桥、缺口等 tile 级信息。
 - `exit_type_head`：输出 `8 x 10` 出口类型图，负责区分 `normal`、`locked_key`、`conditional`。
+- `chest_state_head`：输出独立的 `8 x 10` 宝箱状态图，负责区分 `none`、`closed`、`opened`；因此宝箱可以与桥等地形共用同一 tile。
 - `heatmap_head`：输出玩家/怪物的像素级中心点 heatmap，负责动态实体的精确位置。
 
 所以 perception 不是只返回 tile，也不是只返回 pixel，而是混合表示：
@@ -145,18 +146,23 @@ cd /home/VIG/data2/dangyunkai/wuhaoyi/Mathematical-Logic
 ```bash
 /home/VIG/data2/conda_envs/ml/bin/python -m nesylink.perception.cnn collect-train \
   --samples 2400 \
-  --epochs 18 \
+  --exit-overlap-ratio 0.15 \
+  --epochs 16 \
   --batch-size 64 \
   --data nesylink/perception/data/perception_dataset.npz \
   --weights nesylink/perception/perception_model.pt \
+  --chest-head-only \
   --device cpu
 ```
+
+`--chest-head-only` 用于在已有兼容权重上冻结旧编码器、tile/出口/热力图 head，只训练独立宝箱状态 head。训练会先缓存 `8 x 10` 编码特征，减少 CPU 重复反向传播。
 
 只采集数据：
 
 ```bash
 /home/VIG/data2/conda_envs/ml/bin/python -m nesylink.perception.cnn collect \
   --samples 2400 \
+  --exit-overlap-ratio 0.15 \
   --output nesylink/perception/data/perception_dataset.npz
 ```
 
@@ -166,23 +172,27 @@ cd /home/VIG/data2/dangyunkai/wuhaoyi/Mathematical-Logic
 /home/VIG/data2/conda_envs/ml/bin/python -m nesylink.perception.cnn train \
   --data nesylink/perception/data/perception_dataset.npz \
   --weights nesylink/perception/perception_model.pt \
-  --epochs 18 \
+  --epochs 16 \
   --batch-size 64 \
+  --chest-head-only \
   --device cpu
 ```
 
 ## 当前权重指标
 
-当前 `perception_model.pt` 在 `perception_dataset.npz` 上对所有支持变体的评估结果：
+当前 `perception_model.pt` 的旧编码器、tile/出口/热力图 head 与上一版权重逐元素一致；新增宝箱状态 head 在独立随机种子、600 张图像的 holdout 上结果如下：
 
 ```text
-default        tile_acc=0.999839  exit_type_acc=1.000000  player_err=1.081px  monster_recall=0.993639
-grayscale      tile_acc=0.999828  exit_type_acc=1.000000  player_err=1.070px  monster_recall=0.994487
-dark           tile_acc=0.999818  exit_type_acc=1.000000  player_err=1.072px  monster_recall=0.993639
-bright         tile_acc=0.999849  exit_type_acc=1.000000  player_err=1.078px  monster_recall=0.995759
-high_contrast  tile_acc=0.999839  exit_type_acc=1.000000  player_err=1.134px  monster_recall=0.993639
-inverted       tile_acc=0.999807  exit_type_acc=1.000000  player_err=1.177px  monster_recall=0.996607
+variant        closed_recall  opened_recall  false_positive_rate
+default        0.975225       0.984043       0.000382
+grayscale      0.986486       0.992021       0.000382
+dark           0.975225       0.992021       0.000382
+bright         0.950450       0.992021       0.000382
+high_contrast  1.000000       0.992021       0.000042
+inverted       0.968468       0.978723       0.000403
 ```
+
+端到端单种子回归：Task 1 grayscale 在 290 步完成，Task 2 default 在 166 步完成，Task 3 spatial_b 在 566 步完成，Task 4 default 在 1119 步完成并触发 `world_completed`。Task 5 default 未通过；该策略没有收到/设置 `task_id`，因此未进入 Task 5 专用分支，不属于本次感知修改范围。
 
 单帧 CPU 推理耗时：
 
@@ -212,4 +222,5 @@ export MKL_NUM_THREADS=16
 - `health`、`keys`、`gold`、`items` 目前没有从像素中恢复，`engine.extract` 中保守填默认值。
 - `monster_types` 当前填 `"unknown"`，如需区分 chaser/patroller/ambusher，需要给 CNN 增加怪物类型分类 head 或引入时序跟踪。
 - `static_grid` 字段名沿用现有接口，但内容是完整 CNN 语义图，里面也可能包含 player/monster 这类动态对象。
+- `tile_head` 是单标签语义图；宝箱开闭状态由独立训练的 `chest_state_head` 提供，因此可与桥等地形同时存在，并可抑制已打开宝箱造成的假出口或假怪物。
 - 训练标签来自 structured observation，只在训练阶段使用；正式推理入口不要读这些标签。

@@ -62,8 +62,11 @@ class PerceptionEngine:
             confidence_threshold=self.confidence_threshold,
         )
         grid = prediction["grid"]
+        opened_chest_tiles = set(prediction.get("opened_chests", ()))
+        closed_chest_tiles = set(prediction.get("closed_chests", _all_tiles(grid, TILE_CHEST)))
+        detected_chest_tiles = opened_chest_tiles | closed_chest_tiles
         player_grid_tile = _first_tile(grid, TILE_PLAYER)
-        monster_grid_tiles = _all_tiles(grid, TILE_MONSTER)
+        monster_grid_tiles = _all_tiles(grid, TILE_MONSTER) - detected_chest_tiles
 
         player_entity = _entity_from_detection(prediction.get("player"), "player")
         if player_entity is not None and player_grid_tile is not None:
@@ -72,6 +75,7 @@ class PerceptionEngine:
             _snap_entity_to_grid(entity, monster_grid_tiles)
             for detection in prediction.get("monsters", ())
             if (entity := _entity_from_detection(detection, "monster")) is not None
+            and entity.tile not in detected_chest_tiles
         )
 
         player_tile = player_grid_tile
@@ -88,10 +92,14 @@ class PerceptionEngine:
             keys=0,
             monsters=frozenset(monster_tiles),
             monster_types={entity.tile: entity.entity_type for entity in monster_entities},
-            chests=frozenset(_all_tiles(grid, TILE_CHEST)),
+            chests=frozenset(closed_chest_tiles),
             traps=frozenset(_all_tiles(grid, TILE_TRAP)),
-            exits=frozenset(_all_tiles(grid, TILE_EXIT)),
-            exit_types=dict(prediction.get("exit_types", {})),
+            exits=frozenset(_all_tiles(grid, TILE_EXIT) - detected_chest_tiles),
+            exit_types={
+                tile: exit_type
+                for tile, exit_type in prediction.get("exit_types", {}).items()
+                if tile not in detected_chest_tiles
+            },
             buttons=frozenset(_all_tiles(grid, TILE_BUTTON)),
             gaps=frozenset(_all_tiles(grid, TILE_GAP)),
             bridges=frozenset(_all_tiles(grid, TILE_BRIDGE)),

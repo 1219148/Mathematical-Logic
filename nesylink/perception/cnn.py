@@ -18,6 +18,9 @@ NUM_TILE_CLASSES = 12
 EXIT_TYPE_NAMES = ("none", "normal", "locked_key", "conditional")
 EXIT_TYPE_TO_INDEX = {name: index for index, name in enumerate(EXIT_TYPE_NAMES)}
 NUM_EXIT_TYPE_CLASSES = len(EXIT_TYPE_NAMES)
+CHEST_STATE_NAMES = ("none", "closed", "opened")
+CHEST_STATE_TO_INDEX = {name: index for index, name in enumerate(CHEST_STATE_NAMES)}
+NUM_CHEST_STATE_CLASSES = len(CHEST_STATE_NAMES)
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
 DEFAULT_DATASET = DEFAULT_DATA_DIR / "perception_dataset.npz"
 DEFAULT_WEIGHTS = Path(__file__).resolve().parent / "perception_model.pt"
@@ -31,6 +34,7 @@ class DatasetConfig:
     output: Path = DEFAULT_DATASET
     samples: int = 2400
     builtin_ratio: float = 0.45
+    exit_overlap_ratio: float = 0.15
     max_monsters: int = 6
     seed: int = 0
 
@@ -74,6 +78,7 @@ class TinyPerceptionCNN(_BaseTorchModule()):
         self,
         num_classes: int = NUM_TILE_CLASSES,
         num_exit_type_classes: int = NUM_EXIT_TYPE_CLASSES,
+        num_chest_state_classes: int = NUM_CHEST_STATE_CLASSES,
     ) -> None:
         torch, nn, _ = _torch_modules()
         super().__init__()
@@ -108,6 +113,12 @@ class TinyPerceptionCNN(_BaseTorchModule()):
             nn.ReLU(inplace=True),
             nn.Conv2d(64, num_exit_type_classes, kernel_size=1),
         )
+        self.chest_state_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d((GRID_HEIGHT, GRID_WIDTH)),
+            nn.Conv2d(96, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, num_chest_state_classes, kernel_size=1),
+        )
         self.heatmap_head = nn.Sequential(
             nn.Conv2d(96, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -119,6 +130,7 @@ class TinyPerceptionCNN(_BaseTorchModule()):
         features = self.encoder(images)
         tile_logits = self.tile_head(features)
         exit_type_logits = self.exit_type_head(features)
+        chest_state_logits = self.chest_state_head(features)
         heatmap_logits = self.heatmap_head(features)
         heatmap_logits = self._interpolate(
             heatmap_logits,
@@ -129,6 +141,7 @@ class TinyPerceptionCNN(_BaseTorchModule()):
         return {
             "tile_logits": tile_logits,
             "exit_type_logits": exit_type_logits,
+            "chest_state_logits": chest_state_logits,
             "heatmap_logits": heatmap_logits,
         }
 
@@ -152,6 +165,10 @@ class PerceptionDataset(_BaseTorchDataset()):
             self.exit_type_grids = data["exit_type_grids"][indices]
         else:
             self.exit_type_grids = _fallback_exit_type_grids(self.grids)
+        if "chest_state_grids" in data.files:
+            self.chest_state_grids = data["chest_state_grids"][indices]
+        else:
+            self.chest_state_grids = _fallback_chest_state_grids(self.grids)
         self.player_centers = data["player_centers"][indices]
         self.monster_centers = data["monster_centers"][indices]
         self.monster_masks = data["monster_masks"][indices]
@@ -176,6 +193,7 @@ class PerceptionDataset(_BaseTorchDataset()):
         image_tensor = self.torch.from_numpy(np.transpose(image, (2, 0, 1))).float()
         grid_tensor = self.torch.from_numpy(self.grids[sample_index].astype(np.int64))
         exit_type_tensor = self.torch.from_numpy(self.exit_type_grids[sample_index].astype(np.int64))
+        chest_state_tensor = self.torch.from_numpy(self.chest_state_grids[sample_index].astype(np.int64))
         heatmap = _make_heatmaps(
             self.player_centers[sample_index],
             self.monster_centers[sample_index],
@@ -185,6 +203,7 @@ class PerceptionDataset(_BaseTorchDataset()):
             "image": image_tensor,
             "grid": grid_tensor,
             "exit_type_grid": exit_type_tensor,
+            "chest_state_grid": chest_state_tensor,
             "heatmap": self.torch.from_numpy(heatmap).float(),
         }
 
@@ -195,6 +214,13 @@ def collect_dataset(config: DatasetConfig) -> Path:
     数据来源包含公开任务 rollout 和随机单房间地图。标签来自 structured obs，
     只用于训练阶段；最终 PerceptionEngine.extract 不会读取 info。
     """
+    if config.samples < 1:
+        raise ValueError("samples must be >= 1")
+    if config.builtin_ratio < 0 or config.exit_overlap_ratio < 0:
+        raise ValueError("dataset ratios must be non-negative")
+    if config.builtin_ratio + config.exit_overlap_ratio > 1:
+        raise ValueError("builtin_ratio + exit_overlap_ratio must be <= 1")
+
     rng = random.Random(config.seed)
     output = Path(config.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -202,18 +228,33 @@ def collect_dataset(config: DatasetConfig) -> Path:
     images: list[np.ndarray] = []
     grids: list[np.ndarray] = []
     exit_type_grids: list[np.ndarray] = []
+    chest_state_grids: list[np.ndarray] = []
     player_centers: list[np.ndarray] = []
     monster_centers: list[np.ndarray] = []
     monster_masks: list[np.ndarray] = []
 
     builtin_samples = int(config.samples * config.builtin_ratio)
-    random_samples = max(0, config.samples - builtin_samples)
+    exit_overlap_samples = int(config.samples * config.exit_overlap_ratio)
+    random_samples = max(0, config.samples - builtin_samples - exit_overlap_samples)
     _collect_builtin_samples(
         target_count=builtin_samples,
         rng=rng,
         images=images,
         grids=grids,
         exit_type_grids=exit_type_grids,
+        chest_state_grids=chest_state_grids,
+        player_centers=player_centers,
+        monster_centers=monster_centers,
+        monster_masks=monster_masks,
+        max_monsters=config.max_monsters,
+    )
+    _collect_exit_overlap_samples(
+        target_count=exit_overlap_samples,
+        rng=rng,
+        images=images,
+        grids=grids,
+        exit_type_grids=exit_type_grids,
+        chest_state_grids=chest_state_grids,
         player_centers=player_centers,
         monster_centers=monster_centers,
         monster_masks=monster_masks,
@@ -225,6 +266,7 @@ def collect_dataset(config: DatasetConfig) -> Path:
         images=images,
         grids=grids,
         exit_type_grids=exit_type_grids,
+        chest_state_grids=chest_state_grids,
         player_centers=player_centers,
         monster_centers=monster_centers,
         monster_masks=monster_masks,
@@ -237,6 +279,7 @@ def collect_dataset(config: DatasetConfig) -> Path:
         images=np.stack(images).astype(np.uint8),
         grids=np.stack(grids).astype(np.uint8),
         exit_type_grids=np.stack(exit_type_grids).astype(np.uint8),
+        chest_state_grids=np.stack(chest_state_grids).astype(np.uint8),
         player_centers=np.stack(player_centers).astype(np.float32),
         monster_centers=np.stack(monster_centers).astype(np.float32),
         monster_masks=np.stack(monster_masks).astype(np.bool_),
@@ -253,6 +296,7 @@ def train_model(
     lr: float = 1e-3,
     seed: int = 0,
     device: str | None = None,
+    chest_head_only: bool = False,
 ) -> dict[str, float]:
     torch, nn, _ = _torch_modules()
     DataLoader = torch.utils.data.DataLoader
@@ -280,8 +324,35 @@ def train_model(
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     model = TinyPerceptionCNN().to(resolved_device)
-    _warm_start_model(model, weights_path, torch, resolved_device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    warm_started = _warm_start_model(model, weights_path, torch, resolved_device)
+    if chest_head_only:
+        if not warm_started:
+            raise ValueError("--chest-head-only requires an existing compatible checkpoint")
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for parameter in model.chest_state_head.parameters():
+            parameter.requires_grad_(True)
+        trainable_parameters = model.chest_state_head.parameters()
+    else:
+        trainable_parameters = model.parameters()
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=lr, weight_decay=1e-4)
+    if chest_head_only:
+        train_loader = _cache_chest_feature_loader(
+            model,
+            train_loader,
+            device=resolved_device,
+            torch=torch,
+            batch_size=max(batch_size, 256),
+            shuffle=True,
+        )
+        val_loader = _cache_chest_feature_loader(
+            model,
+            val_loader,
+            device=resolved_device,
+            torch=torch,
+            batch_size=max(batch_size, 256),
+            shuffle=False,
+        )
     tile_weights = _tile_class_weights(data["grids"]).to(resolved_device)
     exit_type_labels = (
         data["exit_type_grids"]
@@ -289,8 +360,15 @@ def train_model(
         else _fallback_exit_type_grids(data["grids"])
     )
     exit_type_weights = _exit_type_class_weights(exit_type_labels).to(resolved_device)
+    chest_state_labels = (
+        data["chest_state_grids"]
+        if "chest_state_grids" in data.files
+        else _fallback_chest_state_grids(data["grids"])
+    )
+    chest_state_weights = _chest_state_class_weights(chest_state_labels).to(resolved_device)
     tile_loss_fn = nn.CrossEntropyLoss(weight=tile_weights)
     exit_type_loss_fn = nn.CrossEntropyLoss(weight=exit_type_weights)
+    chest_state_loss_fn = nn.CrossEntropyLoss(weight=chest_state_weights)
     heatmap_loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(12.0, device=resolved_device))
 
     best_val = float("inf")
@@ -298,19 +376,32 @@ def train_model(
     patience = 4
     stale_epochs = 0
     for epoch in range(1, epochs + 1):
-        model.train()
+        if chest_head_only:
+            model.eval()
+            model.chest_state_head.train()
+        else:
+            model.train()
         train_loss = 0.0
         train_batches = 0
         for batch in train_loader:
-            images = batch["image"].to(resolved_device)
-            grids = batch["grid"].to(resolved_device)
-            exit_type_grids = batch["exit_type_grid"].to(resolved_device)
-            heatmaps = batch["heatmap"].to(resolved_device)
-            output = model(images)
-            tile_loss = tile_loss_fn(output["tile_logits"], grids)
-            exit_type_loss = exit_type_loss_fn(output["exit_type_logits"], exit_type_grids)
-            heatmap_loss = heatmap_loss_fn(output["heatmap_logits"], heatmaps)
-            loss = tile_loss + 0.30 * exit_type_loss + 0.35 * heatmap_loss
+            if chest_head_only:
+                features, chest_state_grids = batch
+                features = features.to(resolved_device)
+                chest_state_grids = chest_state_grids.to(resolved_device)
+                chest_state_logits = model.chest_state_head(features)
+                loss = chest_state_loss_fn(chest_state_logits, chest_state_grids)
+            else:
+                images = batch["image"].to(resolved_device)
+                chest_state_grids = batch["chest_state_grid"].to(resolved_device)
+                grids = batch["grid"].to(resolved_device)
+                exit_type_grids = batch["exit_type_grid"].to(resolved_device)
+                heatmaps = batch["heatmap"].to(resolved_device)
+                output = model(images)
+                tile_loss = tile_loss_fn(output["tile_logits"], grids)
+                exit_type_loss = exit_type_loss_fn(output["exit_type_logits"], exit_type_grids)
+                chest_state_loss = chest_state_loss_fn(output["chest_state_logits"], chest_state_grids)
+                heatmap_loss = heatmap_loss_fn(output["heatmap_logits"], heatmaps)
+                loss = tile_loss + 0.30 * exit_type_loss + 0.55 * chest_state_loss + 0.35 * heatmap_loss
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -318,16 +409,32 @@ def train_model(
             train_loss += float(loss.detach().cpu())
             train_batches += 1
 
-        metrics = evaluate_model(model, val_loader, device=resolved_device)
-        metrics["train_loss"] = train_loss / max(1, train_batches)
-        print(
-            f"epoch={epoch:02d} train_loss={metrics['train_loss']:.4f} "
-            f"val_loss={metrics['val_loss']:.4f} tile_acc={metrics['tile_acc']:.4f} "
-            f"exit_type_acc={metrics['exit_type_acc']:.4f} "
-            f"player_err={metrics['player_center_error_px']:.2f}px "
-            f"monster_recall={metrics['monster_tile_recall']:.4f}",
-            flush=True,
+        metrics = (
+            evaluate_chest_head(model, val_loader, device=resolved_device)
+            if chest_head_only
+            else evaluate_model(model, val_loader, device=resolved_device)
         )
+        metrics["train_loss"] = train_loss / max(1, train_batches)
+        if chest_head_only:
+            print(
+                f"epoch={epoch:02d} train_loss={metrics['train_loss']:.4f} "
+                f"val_loss={metrics['val_loss']:.4f} chest_acc={metrics['chest_state_acc']:.4f} "
+                f"chest_closed_recall={metrics['chest_closed_recall']:.4f} "
+                f"chest_open_recall={metrics['chest_open_recall']:.4f} "
+                f"chest_fpr={metrics['chest_false_positive_rate']:.6f}",
+                flush=True,
+            )
+        else:
+            print(
+                f"epoch={epoch:02d} train_loss={metrics['train_loss']:.4f} "
+                f"val_loss={metrics['val_loss']:.4f} tile_acc={metrics['tile_acc']:.4f} "
+                f"exit_type_acc={metrics['exit_type_acc']:.4f} "
+                f"chest_closed_recall={metrics['chest_closed_recall']:.4f} "
+                f"chest_open_recall={metrics['chest_open_recall']:.4f} "
+                f"player_err={metrics['player_center_error_px']:.2f}px "
+                f"monster_recall={metrics['monster_tile_recall']:.4f}",
+                flush=True,
+            )
         if metrics["val_loss"] < best_val:
             best_val = metrics["val_loss"]
             best_metrics = dict(metrics)
@@ -337,7 +444,9 @@ def train_model(
                     "state_dict": model.state_dict(),
                     "num_tile_classes": NUM_TILE_CLASSES,
                     "num_exit_type_classes": NUM_EXIT_TYPE_CLASSES,
+                    "num_chest_state_classes": NUM_CHEST_STATE_CLASSES,
                     "exit_type_names": EXIT_TYPE_NAMES,
+                    "chest_state_names": CHEST_STATE_NAMES,
                     "metrics": best_metrics,
                     "dataset": str(dataset_path),
                 },
@@ -345,7 +454,7 @@ def train_model(
             )
         else:
             stale_epochs += 1
-            if stale_epochs >= patience and metrics["tile_acc"] > 0.97:
+            if stale_epochs >= patience and (chest_head_only or metrics["tile_acc"] > 0.97):
                 break
     return best_metrics
 
@@ -354,6 +463,7 @@ def evaluate_model(model: Any, loader: Any, *, device: Any) -> dict[str, float]:
     torch, nn, _ = _torch_modules()
     tile_loss_fn = nn.CrossEntropyLoss()
     exit_type_loss_fn = nn.CrossEntropyLoss()
+    chest_state_loss_fn = nn.CrossEntropyLoss()
     heatmap_loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(12.0, device=device))
     model.eval()
     total_loss = 0.0
@@ -361,6 +471,14 @@ def evaluate_model(model: Any, loader: Any, *, device: Any) -> dict[str, float]:
     correct_tiles = 0
     exit_type_total = 0
     correct_exit_types = 0
+    chest_state_total = 0
+    correct_chest_states = 0
+    chest_closed_hits = 0
+    chest_closed_total = 0
+    chest_open_hits = 0
+    chest_open_total = 0
+    chest_false_positives = 0
+    chest_none_total = 0
     player_errors: list[float] = []
     monster_hits = 0
     monster_total = 0
@@ -370,11 +488,13 @@ def evaluate_model(model: Any, loader: Any, *, device: Any) -> dict[str, float]:
             images = batch["image"].to(device)
             grids = batch["grid"].to(device)
             exit_type_grids = batch["exit_type_grid"].to(device)
+            chest_state_grids = batch["chest_state_grid"].to(device)
             heatmaps = batch["heatmap"].to(device)
             output = model(images)
             loss = (
                 tile_loss_fn(output["tile_logits"], grids)
                 + 0.30 * exit_type_loss_fn(output["exit_type_logits"], exit_type_grids)
+                + 0.55 * chest_state_loss_fn(output["chest_state_logits"], chest_state_grids)
                 + 0.35
                 * heatmap_loss_fn(
                     output["heatmap_logits"],
@@ -391,6 +511,19 @@ def evaluate_model(model: Any, loader: Any, *, device: Any) -> dict[str, float]:
             exit_mask = exit_type_grids != EXIT_TYPE_TO_INDEX["none"]
             correct_exit_types += int((pred_exit_type_grid[exit_mask] == exit_type_grids[exit_mask]).sum().cpu())
             exit_type_total += int(exit_mask.sum().cpu())
+
+            pred_chest_state_grid = output["chest_state_logits"].argmax(dim=1)
+            correct_chest_states += int((pred_chest_state_grid == chest_state_grids).sum().cpu())
+            chest_state_total += int(chest_state_grids.numel())
+            closed_mask = chest_state_grids == CHEST_STATE_TO_INDEX["closed"]
+            open_mask = chest_state_grids == CHEST_STATE_TO_INDEX["opened"]
+            none_mask = chest_state_grids == CHEST_STATE_TO_INDEX["none"]
+            chest_closed_hits += int((pred_chest_state_grid[closed_mask] == CHEST_STATE_TO_INDEX["closed"]).sum().cpu())
+            chest_closed_total += int(closed_mask.sum().cpu())
+            chest_open_hits += int((pred_chest_state_grid[open_mask] == CHEST_STATE_TO_INDEX["opened"]).sum().cpu())
+            chest_open_total += int(open_mask.sum().cpu())
+            chest_false_positives += int((pred_chest_state_grid[none_mask] != CHEST_STATE_TO_INDEX["none"]).sum().cpu())
+            chest_none_total += int(none_mask.sum().cpu())
 
             probs = torch.sigmoid(output["heatmap_logits"]).cpu().numpy()
             true_heatmaps = heatmaps.cpu().numpy()
@@ -416,8 +549,92 @@ def evaluate_model(model: Any, loader: Any, *, device: Any) -> dict[str, float]:
         "val_loss": total_loss / max(1, batches),
         "tile_acc": correct_tiles / max(1, total_tiles),
         "exit_type_acc": correct_exit_types / max(1, exit_type_total),
+        "chest_state_acc": correct_chest_states / max(1, chest_state_total),
+        "chest_closed_recall": chest_closed_hits / max(1, chest_closed_total),
+        "chest_open_recall": chest_open_hits / max(1, chest_open_total),
+        "chest_false_positive_rate": chest_false_positives / max(1, chest_none_total),
         "player_center_error_px": float(np.mean(player_errors)) if player_errors else 0.0,
         "monster_tile_recall": monster_hits / max(1, monster_total),
+    }
+
+
+def _cache_chest_feature_loader(
+    model: Any,
+    loader: Any,
+    *,
+    device: Any,
+    torch: Any,
+    batch_size: int,
+    shuffle: bool,
+) -> Any:
+    """Run the frozen encoder once and cache compact per-tile features on CPU."""
+    model.encoder.eval()
+    feature_batches: list[Any] = []
+    label_batches: list[Any] = []
+    with torch.no_grad():
+        for batch in loader:
+            images = batch["image"].to(device)
+            features = model.chest_state_head[0](model.encoder(images))
+            feature_batches.append(features.cpu())
+            label_batches.append(batch["chest_state_grid"].cpu())
+    features = torch.cat(feature_batches, dim=0)
+    labels = torch.cat(label_batches, dim=0)
+    dataset = torch.utils.data.TensorDataset(features, labels)
+    print(f"cached_chest_features={len(dataset)}", flush=True)
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,
+    )
+
+
+def evaluate_chest_head(model: Any, loader: Any, *, device: Any) -> dict[str, float]:
+    """Evaluate the independently trainable chest head without running unrelated heads."""
+    torch, nn, _ = _torch_modules()
+    loss_fn = nn.CrossEntropyLoss()
+    model.eval()
+    total_loss = 0.0
+    batches = 0
+    total = 0
+    correct = 0
+    closed_hits = 0
+    closed_total = 0
+    open_hits = 0
+    open_total = 0
+    false_positives = 0
+    none_total = 0
+    with torch.no_grad():
+        for batch in loader:
+            if isinstance(batch, (tuple, list)):
+                features, labels = batch
+                logits = model.chest_state_head(features.to(device))
+                labels = labels.to(device)
+            else:
+                images = batch["image"].to(device)
+                labels = batch["chest_state_grid"].to(device)
+                logits = model.chest_state_head(model.encoder(images))
+            predictions = logits.argmax(dim=1)
+            total_loss += float(loss_fn(logits, labels).cpu())
+            batches += 1
+            correct += int((predictions == labels).sum().cpu())
+            total += int(labels.numel())
+            closed_mask = labels == CHEST_STATE_TO_INDEX["closed"]
+            open_mask = labels == CHEST_STATE_TO_INDEX["opened"]
+            none_mask = labels == CHEST_STATE_TO_INDEX["none"]
+            closed_hits += int((predictions[closed_mask] == CHEST_STATE_TO_INDEX["closed"]).sum().cpu())
+            closed_total += int(closed_mask.sum().cpu())
+            open_hits += int((predictions[open_mask] == CHEST_STATE_TO_INDEX["opened"]).sum().cpu())
+            open_total += int(open_mask.sum().cpu())
+            false_positives += int((predictions[none_mask] != CHEST_STATE_TO_INDEX["none"]).sum().cpu())
+            none_total += int(none_mask.sum().cpu())
+
+    return {
+        "val_loss": total_loss / max(1, batches),
+        "chest_state_acc": correct / max(1, total),
+        "chest_closed_recall": closed_hits / max(1, closed_total),
+        "chest_open_recall": open_hits / max(1, open_total),
+        "chest_false_positive_rate": false_positives / max(1, none_total),
     }
 
 
@@ -462,6 +679,18 @@ def _exit_type_class_weights(exit_type_grids: np.ndarray) -> Any:
     return torch.from_numpy(weights.astype(np.float32))
 
 
+def _chest_state_class_weights(chest_state_grids: np.ndarray) -> Any:
+    torch, _, _ = _torch_modules()
+    counts = np.bincount(
+        chest_state_grids.reshape(-1).astype(np.int64),
+        minlength=NUM_CHEST_STATE_CLASSES,
+    ).astype(np.float32)
+    counts += 1.0
+    weights = np.sqrt(counts.sum() / counts)
+    weights = weights / weights.mean()
+    return torch.from_numpy(weights.astype(np.float32))
+
+
 def load_model(weights_path: str | Path = DEFAULT_WEIGHTS, *, device: str | None = None) -> tuple[Any, Any]:
     torch, _, _ = _torch_modules()
     resolved_device = _resolve_device(torch, device)
@@ -473,11 +702,17 @@ def load_model(weights_path: str | Path = DEFAULT_WEIGHTS, *, device: str | None
     model = TinyPerceptionCNN(
         num_classes=int(checkpoint.get("num_tile_classes", NUM_TILE_CLASSES)),
         num_exit_type_classes=int(checkpoint.get("num_exit_type_classes", NUM_EXIT_TYPE_CLASSES)),
+        num_chest_state_classes=int(checkpoint.get("num_chest_state_classes", NUM_CHEST_STATE_CLASSES)),
     )
     incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
     allowed_missing = {
-        name for name in incompatible.missing_keys if name.startswith("exit_type_head.")
+        name
+        for name in incompatible.missing_keys
+        if name.startswith("exit_type_head.") or name.startswith("chest_state_head.")
     }
+    model.has_trained_chest_state_head = not any(
+        name.startswith("chest_state_head.") for name in incompatible.missing_keys
+    )
     unexpected = list(incompatible.unexpected_keys)
     missing = [name for name in incompatible.missing_keys if name not in allowed_missing]
     if unexpected or missing:
@@ -489,16 +724,16 @@ def load_model(weights_path: str | Path = DEFAULT_WEIGHTS, *, device: str | None
     return model, torch
 
 
-def _warm_start_model(model: Any, weights_path: Path, torch: Any, device: Any) -> None:
+def _warm_start_model(model: Any, weights_path: Path, torch: Any, device: Any) -> bool:
     if not weights_path.exists():
-        return
+        return False
     try:
         checkpoint = torch.load(weights_path, map_location=device, weights_only=True)
     except TypeError:
         checkpoint = torch.load(weights_path, map_location=device)
     state_dict = checkpoint.get("state_dict")
     if not isinstance(state_dict, dict):
-        return
+        return False
 
     current_state = model.state_dict()
     compatible_state = {
@@ -507,9 +742,10 @@ def _warm_start_model(model: Any, weights_path: Path, torch: Any, device: Any) -
         if name in current_state and tuple(tensor.shape) == tuple(current_state[name].shape)
     }
     if not compatible_state:
-        return
+        return False
     model.load_state_dict(compatible_state, strict=False)
     print(f"warm_start_params={len(compatible_state)}", flush=True)
+    return True
 
 
 def predict_frame(
@@ -531,6 +767,10 @@ def predict_frame(
             exit_type_grid = output["exit_type_logits"].argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
         else:
             exit_type_grid = _fallback_exit_type_grids(grid[None, ...])[0]
+        if getattr(model, "has_trained_chest_state_head", True) and "chest_state_logits" in output:
+            chest_state_grid = output["chest_state_logits"].argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+        else:
+            chest_state_grid = _fallback_chest_state_grids(grid[None, ...])[0]
         heatmaps = torch.sigmoid(output["heatmap_logits"])[0].cpu().numpy()
 
     player_conf = float(heatmaps[0].max())
@@ -563,10 +803,18 @@ def predict_frame(
         "grid": grid,
         "exit_type_grid": exit_type_grid,
         "exit_types": _exit_types_from_prediction(grid, exit_type_grid),
+        "chest_state_grid": chest_state_grid,
+        "closed_chests": _tiles_from_class_grid(chest_state_grid, CHEST_STATE_TO_INDEX["closed"]),
+        "opened_chests": _tiles_from_class_grid(chest_state_grid, CHEST_STATE_TO_INDEX["opened"]),
         "player": player,
         "monsters": tuple(monsters),
         "heatmaps": heatmaps,
     }
+
+
+def _tiles_from_class_grid(grid: np.ndarray, class_index: int) -> set[tuple[int, int]]:
+    rows, cols = np.where(grid == class_index)
+    return {(int(col), int(row)) for row, col in zip(rows, cols)}
 
 
 def _collect_builtin_samples(
@@ -576,6 +824,7 @@ def _collect_builtin_samples(
     images: list[np.ndarray],
     grids: list[np.ndarray],
     exit_type_grids: list[np.ndarray],
+    chest_state_grids: list[np.ndarray],
     player_centers: list[np.ndarray],
     monster_centers: list[np.ndarray],
     monster_masks: list[np.ndarray],
@@ -590,12 +839,14 @@ def _collect_builtin_samples(
         env = make_env(task_id=task_id, observation_mode="full", render_mode="rgb_array")
         label, _info = env.reset(seed=rng.randrange(10_000_000))
         for _ in range(per_task):
+            _randomize_visible_chest_states(env, rng)
             _append_sample(
                 env,
                 label,
                 images,
                 grids,
                 exit_type_grids,
+                chest_state_grids,
                 player_centers,
                 monster_centers,
                 monster_masks,
@@ -611,6 +862,69 @@ def _collect_builtin_samples(
         env.close()
 
 
+def _collect_exit_overlap_samples(
+    *,
+    target_count: int,
+    rng: random.Random,
+    images: list[np.ndarray],
+    grids: list[np.ndarray],
+    exit_type_grids: list[np.ndarray],
+    chest_state_grids: list[np.ndarray],
+    player_centers: list[np.ndarray],
+    monster_centers: list[np.ndarray],
+    monster_masks: list[np.ndarray],
+    max_monsters: int,
+) -> None:
+    """Collect hard negatives where the moving player visually overlaps an exit."""
+    from nesylink.core.observation import build_observation
+    from nesylink.env import make_env
+
+    made = 0
+    while made < target_count:
+        task_ids = list(BUILTIN_TASKS)
+        rng.shuffle(task_ids)
+        for task_id in task_ids:
+            env = make_env(task_id=task_id, observation_mode="full", render_mode="rgb_array")
+            env.reset(seed=rng.randrange(10_000_000))
+            runtime = env.engine.runtime
+            room_ids = list(runtime.room_manager.room_ids)
+            rng.shuffle(room_ids)
+            for room_id in room_ids:
+                coord = runtime.room_manager.coord_for_room_id(room_id)
+                runtime.room_coord = coord
+                runtime.room = runtime.room_manager.get_room(coord)
+                exit_tiles = [tile for exit_config in runtime.room.exits for tile in exit_config.tiles]
+                rng.shuffle(exit_tiles)
+                for col, row in exit_tiles:
+                    offset_x = rng.randint(-4, 4)
+                    offset_y = rng.randint(-4, 4)
+                    runtime.player.position_px = (
+                        float(np.clip(col * TILE_SIZE + offset_x, 0, MAP_PIXEL_WIDTH - TILE_SIZE)),
+                        float(np.clip(row * TILE_SIZE + offset_y, 0, MAP_PIXEL_HEIGHT - TILE_SIZE)),
+                    )
+                    runtime.player.facing = rng.choice(("up", "down", "left", "right"))
+                    runtime.player.clear_action()
+                    _randomize_visible_chest_states(env, rng)
+                    label = build_observation(runtime.room, runtime.player, max_monsters)
+                    _append_sample(
+                        env,
+                        label,
+                        images,
+                        grids,
+                        exit_type_grids,
+                        chest_state_grids,
+                        player_centers,
+                        monster_centers,
+                        monster_masks,
+                        max_monsters,
+                    )
+                    made += 1
+                    if made >= target_count:
+                        env.close()
+                        return
+            env.close()
+
+
 def _collect_random_room_samples(
     *,
     target_count: int,
@@ -618,6 +932,7 @@ def _collect_random_room_samples(
     images: list[np.ndarray],
     grids: list[np.ndarray],
     exit_type_grids: list[np.ndarray],
+    chest_state_grids: list[np.ndarray],
     player_centers: list[np.ndarray],
     monster_centers: list[np.ndarray],
     monster_masks: list[np.ndarray],
@@ -637,12 +952,14 @@ def _collect_random_room_samples(
         env = make_env(map_path=room_path, observation_mode="full", render_mode="rgb_array", max_monsters=max_monsters)
         label, _info = env.reset(seed=rng.randrange(10_000_000))
         for _ in range(rng.randint(3, 9)):
+            _randomize_visible_chest_states(env, rng)
             _append_sample(
                 env,
                 label,
                 images,
                 grids,
                 exit_type_grids,
+                chest_state_grids,
                 player_centers,
                 monster_centers,
                 monster_masks,
@@ -664,14 +981,19 @@ def _append_sample(
     images: list[np.ndarray],
     grids: list[np.ndarray],
     exit_type_grids: list[np.ndarray],
+    chest_state_grids: list[np.ndarray],
     player_centers: list[np.ndarray],
     monster_centers: list[np.ndarray],
     monster_masks: list[np.ndarray],
     max_monsters: int,
 ) -> None:
     frame = env.render()[:MAP_PIXEL_HEIGHT, :MAP_PIXEL_WIDTH].astype(np.uint8)
-    grid = label["grid"].astype(np.uint8)
+    from nesylink.core.observation import room_observation
+
+    runtime = env.engine.runtime
+    grid = room_observation(runtime.room, runtime.player).astype(np.uint8)
     exit_type_grid = _exit_type_grid_from_env(env)
+    chest_state_grid = _chest_state_grid_from_env(env)
     player_center = np.asarray(label["player_position_px"], dtype=np.float32) + TILE_SIZE * 0.5
     centers = np.full((max_monsters, 2), -1.0, dtype=np.float32)
     masks = np.zeros((max_monsters,), dtype=np.bool_)
@@ -685,6 +1007,7 @@ def _append_sample(
     images.append(frame)
     grids.append(grid)
     exit_type_grids.append(exit_type_grid)
+    chest_state_grids.append(chest_state_grid)
     player_centers.append(player_center)
     monster_centers.append(centers)
     monster_masks.append(masks)
@@ -727,9 +1050,18 @@ def _random_room_payload(rng: random.Random) -> dict[str, Any]:
                 return tile
         return None
 
+    chest_positions: list[tuple[int, int]] = []
     for idx in range(rng.randint(1, 4)):
         if (pos := take_tile()) is not None:
-            objects.append({"id": f"chest_{idx}", "kind": "chest", "pos": list(pos), "loot": {"kind": "key"}})
+            objects.append(
+                {
+                    "id": f"chest_{idx}",
+                    "kind": "chest",
+                    "pos": list(pos),
+                    "loot": {"kind": rng.choice(("key", "gold", "heal"))},
+                }
+            )
+            chest_positions.append(pos)
     for idx in range(rng.randint(2, 8)):
         if (pos := take_tile()) is not None:
             objects.append({"id": f"trap_{idx}", "kind": "trap", "pos": list(pos), "damage": 1})
@@ -771,6 +1103,9 @@ def _random_room_payload(rng: random.Random) -> dict[str, Any]:
         for _ in range(rng.randint(2, 8)):
             if (pos := take_tile()) is not None:
                 dynamic_tiles.append(list(pos))
+        if chest_positions and rng.random() < 0.75:
+            # 独立 chest head 必须学习同一 tile 可同时包含 bridge 和 chest。
+            dynamic_tiles.append(list(rng.choice(chest_positions)))
         if dynamic_tiles:
             dynamic_objects.append(
                 {
@@ -806,10 +1141,36 @@ def _exit_type_grid_from_env(env: Any) -> np.ndarray:
     return grid
 
 
+def _chest_state_grid_from_env(env: Any) -> np.ndarray:
+    grid = np.zeros((GRID_HEIGHT, GRID_WIDTH), dtype=np.uint8)
+    room = env.engine.runtime.room
+    for chest in room.chests.values():
+        if not chest.is_visible:
+            continue
+        state = "opened" if chest.is_open else "closed"
+        col, row = chest.pos
+        grid[row, col] = CHEST_STATE_TO_INDEX[state]
+    return grid
+
+
+def _randomize_visible_chest_states(env: Any, rng: random.Random) -> None:
+    """为训练采集生成关闭/打开宝箱帧；不在推理阶段使用。"""
+
+    for chest in env.engine.runtime.room.chests.values():
+        if chest.is_visible:
+            chest.is_open = rng.random() < 0.45
+
+
 def _fallback_exit_type_grids(grids: np.ndarray) -> np.ndarray:
     exit_type_grids = np.zeros_like(grids, dtype=np.uint8)
     exit_type_grids[np.asarray(grids) == TILE_EXIT] = EXIT_TYPE_TO_INDEX["normal"]
     return exit_type_grids
+
+
+def _fallback_chest_state_grids(grids: np.ndarray) -> np.ndarray:
+    chest_state_grids = np.zeros_like(grids, dtype=np.uint8)
+    chest_state_grids[np.asarray(grids) == TILE_CHEST] = CHEST_STATE_TO_INDEX["closed"]
+    return chest_state_grids
 
 
 def _exit_types_from_prediction(
@@ -939,6 +1300,7 @@ def main(argv: list[str] | None = None) -> None:
     collect_parser.add_argument("--output", default=str(DEFAULT_DATASET))
     collect_parser.add_argument("--samples", type=int, default=2400)
     collect_parser.add_argument("--builtin-ratio", type=float, default=0.45)
+    collect_parser.add_argument("--exit-overlap-ratio", type=float, default=0.15)
     collect_parser.add_argument("--seed", type=int, default=0)
 
     train_parser = subparsers.add_parser("train")
@@ -949,17 +1311,20 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument("--lr", type=float, default=1e-3)
     train_parser.add_argument("--seed", type=int, default=0)
     train_parser.add_argument("--device", default="auto")
+    train_parser.add_argument("--chest-head-only", action="store_true")
 
     combo_parser = subparsers.add_parser("collect-train")
     combo_parser.add_argument("--data", default=str(DEFAULT_DATASET))
     combo_parser.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     combo_parser.add_argument("--samples", type=int, default=2400)
     combo_parser.add_argument("--builtin-ratio", type=float, default=0.45)
+    combo_parser.add_argument("--exit-overlap-ratio", type=float, default=0.15)
     combo_parser.add_argument("--epochs", type=int, default=14)
     combo_parser.add_argument("--batch-size", type=int, default=64)
     combo_parser.add_argument("--lr", type=float, default=1e-3)
     combo_parser.add_argument("--seed", type=int, default=0)
     combo_parser.add_argument("--device", default="auto")
+    combo_parser.add_argument("--chest-head-only", action="store_true")
 
     eval_parser = subparsers.add_parser("eval")
     eval_parser.add_argument("--data", default=str(DEFAULT_DATASET))
@@ -975,6 +1340,7 @@ def main(argv: list[str] | None = None) -> None:
                 output=Path(args.output),
                 samples=args.samples,
                 builtin_ratio=args.builtin_ratio,
+                exit_overlap_ratio=args.exit_overlap_ratio,
                 seed=args.seed,
             )
         )
@@ -988,6 +1354,7 @@ def main(argv: list[str] | None = None) -> None:
             lr=args.lr,
             seed=args.seed,
             device=args.device,
+            chest_head_only=args.chest_head_only,
         )
         print(json.dumps(metrics, indent=2))
     elif args.command == "collect-train":
@@ -996,6 +1363,7 @@ def main(argv: list[str] | None = None) -> None:
                 output=Path(args.data),
                 samples=args.samples,
                 builtin_ratio=args.builtin_ratio,
+                exit_overlap_ratio=args.exit_overlap_ratio,
                 seed=args.seed,
             )
         )
@@ -1007,6 +1375,7 @@ def main(argv: list[str] | None = None) -> None:
             lr=args.lr,
             seed=args.seed,
             device=args.device,
+            chest_head_only=args.chest_head_only,
         )
         print(json.dumps(metrics, indent=2))
     elif args.command == "eval":
