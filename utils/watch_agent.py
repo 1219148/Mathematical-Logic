@@ -30,7 +30,18 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from evaluate_policy import call_policy, event_names, is_success, load_policy, reset_policy
+from evaluate_policy import (
+    OBS_VARIANTS,
+    SPATIAL_MAP_VARIANTS,
+    apply_obs_variant,
+    build_safe_info,
+    call_policy,
+    event_names,
+    is_success,
+    load_policy,
+    materialize_spatial_map_variant,
+    reset_policy,
+)
 from nesylink.core.constants import ACTION_LABELS, WINDOW_HEIGHT, WINDOW_WIDTH
 from nesylink.env import make_env
 from nesylink.tasks import list_tasks
@@ -54,6 +65,23 @@ def parse_args() -> argparse.Namespace:
         help="Task ID to run.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Episode seed.")
+    parser.add_argument(
+        "--map-variant",
+        default="default",
+        choices=("default", *SPATIAL_MAP_VARIANTS),
+        help="Spatial map variant to run.",
+    )
+    parser.add_argument(
+        "--obs-variant",
+        default="default",
+        choices=OBS_VARIANTS,
+        help="Observation variant passed to the policy.",
+    )
+    parser.add_argument(
+        "--pass-task-id",
+        action="store_true",
+        help="Include task_id in safe policy info. By default this mirrors shared-policy evaluation.",
+    )
     parser.add_argument("--max-steps", type=int, default=None, help="Override task max_steps.")
     parser.add_argument("--fps", type=int, default=30, help="Viewer frames per second.")
     parser.add_argument(
@@ -133,6 +161,8 @@ def draw_overlay(
     *,
     task_id: str,
     seed: int,
+    map_variant: str,
+    obs_variant: str,
     step: int,
     action: int,
     reward: float,
@@ -155,7 +185,13 @@ def draw_overlay(
     status_color = OVERLAY_OK if success else OVERLAY_BAD if done else OVERLAY_TEXT
 
     y = 8
-    y += draw_text(screen, font, f"{task_id}  seed={seed}  step={step}", (10, y), OVERLAY_TEXT)
+    y += draw_text(
+        screen,
+        font,
+        f"{task_id}  map={map_variant}  obs={obs_variant}  seed={seed}  step={step}",
+        (10, y),
+        OVERLAY_TEXT,
+    )
     y += draw_text(
         screen,
         font,
@@ -209,10 +245,14 @@ def main() -> None:
     }
     if args.max_steps is not None:
         env_kwargs["max_steps"] = args.max_steps
-    env = make_env(task_id=args.task, **env_kwargs)
+    if args.map_variant == "default":
+        env = make_env(task_id=args.task, **env_kwargs)
+    else:
+        variant_map_path = materialize_spatial_map_variant(args.task, args.map_variant, seed=args.seed)
+        env = make_env(task_id=args.task, map_path=variant_map_path, **env_kwargs)
 
     pygame.init()
-    pygame.display.set_caption(f"NesyLink Agent Viewer - {args.task}")
+    pygame.display.set_caption(f"NesyLink Agent Viewer - {args.task} {args.map_variant} {args.obs_variant}")
     if args.no_window:
         screen = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT))
     else:
@@ -222,11 +262,17 @@ def main() -> None:
     recorder = VideoRecorder(args.video_out, video_fps) if args.video_out is not None else None
 
     def reset_episode():
-        reset_policy(policy, seed=args.seed, task_id=args.task)
-        reset_obs, reset_info = env.reset(seed=args.seed)
+        reset_policy(policy)
+        raw_obs, raw_info = env.reset(seed=args.seed)
+        obs = apply_obs_variant(raw_obs, args.obs_variant, info=raw_info, env=env)
         return {
-            "obs": reset_obs,
-            "info": reset_info,
+            "obs": obs,
+            "raw_info": raw_info,
+            "policy_info": build_safe_info(
+                raw_info=raw_info,
+                last_reward=0.0,
+                task_id=args.task if args.pass_task_id else None,
+            ),
             "reward": 0.0,
             "total_reward": 0.0,
             "terminated": False,
@@ -268,13 +314,19 @@ def main() -> None:
             done = bool(state["terminated"] or state["truncated"])
             should_step = (args.no_window or not paused or step_once) and not done
             if should_step:
-                action = call_policy(policy, state["obs"], state["info"])
+                action = call_policy(policy, state["obs"], state["policy_info"])
                 if not env.action_space.contains(action):
                     raise ValueError(f"policy returned invalid action {action!r}")
-                obs, reward, terminated, truncated, info = env.step(action)
-                names = event_names(info)
+                raw_obs, reward, terminated, truncated, raw_info = env.step(action)
+                obs = apply_obs_variant(raw_obs, args.obs_variant, info=raw_info, env=env)
+                names = event_names(raw_info)
                 state["obs"] = obs
-                state["info"] = info
+                state["raw_info"] = raw_info
+                state["policy_info"] = build_safe_info(
+                    raw_info=raw_info,
+                    last_reward=float(reward),
+                    task_id=args.task if args.pass_task_id else None,
+                )
                 state["reward"] = float(reward)
                 state["total_reward"] += float(reward)
                 state["terminated"] = bool(terminated)
@@ -283,11 +335,11 @@ def main() -> None:
                 state["action"] = action
                 state["recent_events"] = names
                 state["event_counter"].update(names)
-                state["success"] = is_success(info, bool(terminated))
-                state["terminal_reason"] = info.get("terminal_reason")
+                state["success"] = is_success(raw_info, bool(terminated))
+                state["terminal_reason"] = raw_info.get("terminal_reason")
                 step_once = False
 
-            frame = env.render()
+            frame = state["obs"] if args.obs_variant != "default" else env.render()
             raw_surface = frame_to_surface(frame)
             scaled = pygame.transform.scale(raw_surface, (WINDOW_WIDTH, WINDOW_HEIGHT))
             screen.blit(scaled, (0, 0))
@@ -296,6 +348,8 @@ def main() -> None:
                 font,
                 task_id=args.task,
                 seed=args.seed,
+                map_variant=args.map_variant,
+                obs_variant=args.obs_variant,
                 step=int(state["step"]),
                 action=int(state["action"]),
                 reward=float(state["reward"]),

@@ -4,7 +4,7 @@ import os
 from heapq import heappop, heappush
 from collections import deque
 from dataclasses import dataclass, field, replace
-from typing import Iterable
+from typing import Iterable, Literal
 
 from nesylink.core.observation import TILE_NPC
 from nesylink.core.constants import (
@@ -15,14 +15,25 @@ from nesylink.core.constants import (
     ACTION_NOOP,
     ACTION_RIGHT,
     ACTION_UP,
+    TILE_SIZE,
 )
 from nesylink.shared import SymbolicState
 
+from submissions.temporal_filter import TemporalSymbolicFilter
+
 
 Position = tuple[int, int]
-Side = str
+Side = Literal["up", "down", "left", "right"]
+ObjectiveKind = Literal["fight", "interact", "shield", "navigate", "go_exit", "idle"]
+InteractionKind = Literal["chest", "switch", "button", "monster"]
+SearchMode = Literal["bfs", "astar"]
 TILE_MOVE_TICKS = 16
 EXIT_MOVE_TICKS = 24
+EXIT_ALIGNMENT_TICKS = 2
+EXIT_ALIGNMENT_TOLERANCE_PX = 1.0
+BRIDGE_SCAN_VIEWPOINTS = 1
+INTERACTION_SUCCESS_REWARD = 1.5
+INTERACTION_VISUAL_CONFIRM_TICKS = 5
 
 
 ACTION_TO_DELTA: dict[int, Position] = {
@@ -37,6 +48,7 @@ SIDE_TO_ACTION: dict[Side, int] = {
     "left": ACTION_LEFT,
     "right": ACTION_RIGHT,
 }
+ACTION_TO_SIDE: dict[int, Side] = {action: side for side, action in SIDE_TO_ACTION.items()}
 OPPOSITE_SIDE: dict[Side, Side] = {
     "up": "down",
     "down": "up",
@@ -50,7 +62,14 @@ SIDE_ORDER: tuple[Side, ...] = ("up", "right", "down", "left")
 class InteractionIntent:
     target: Position
     action_to_face: int
-    kind: str
+    kind: InteractionKind
+
+
+@dataclass
+class InteractionAttempt:
+    intent: InteractionIntent
+    inventory_revision: int
+    missing_frames: int = 0
 
 
 @dataclass(frozen=True)
@@ -72,8 +91,9 @@ class RoomMemory:
     opened_chests: set[Position] = field(default_factory=set)
     pressed_buttons: set[Position] = field(default_factory=set)
     has_monster: bool = False
-    has_trap: bool = False
-    visits: int = 0
+    has_button: bool = False
+    interaction_done: bool = False
+    visited_inventory_revisions: set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -84,9 +104,13 @@ class ExitMemory:
 
 @dataclass(frozen=True)
 class Objective:
-    kind: str
+    kind: ObjectiveKind
     targets: frozenset[Position] = frozenset()
     side: Side | None = None
+    interaction_kind: InteractionKind | None = None
+    search: SearchMode = "bfs"
+    safe: bool = False
+    constrain_bridge: bool = True
 
 
 @dataclass(frozen=True)
@@ -180,9 +204,11 @@ def blocked_tiles(
     state: SymbolicState,
     extra_blocked: set[Position] | None = None,
     extra_unblocked: set[Position] | None = None,
+    *,
+    constrain_bridge: bool = True,
 ) -> set[Position]:
     blocked = set(state.walls) | npc_tiles(state) | set(state.traps) | set(state.gaps) | set(state.chests) | set(state.monsters)
-    if bridge_requires_constrained_walk(state):
+    if constrain_bridge and bridge_requires_constrained_walk(state):
         safe_tiles = set(state.bridges) | set(state.exits) | {state.player}
         blocked.update(
             (x, y)
@@ -236,19 +262,28 @@ def is_walkable(
     state: SymbolicState,
     extra_blocked: set[Position] | None = None,
     extra_unblocked: set[Position] | None = None,
+    *,
+    constrain_bridge: bool = True,
 ) -> bool:
-    return in_bounds(pos) and pos not in blocked_tiles(state, extra_blocked, extra_unblocked)
+    return in_bounds(pos) and pos not in blocked_tiles(
+        state,
+        extra_blocked,
+        extra_unblocked,
+        constrain_bridge=constrain_bridge,
+    )
 
 
 def adjacent_walkable_goals(
     state: SymbolicState,
     targets: set[Position],
     extra_blocked: set[Position] | None = None,
+    *,
+    constrain_bridge: bool = True,
 ) -> set[Position]:
     goals: set[Position] = set()
     for target in targets:
         for pos in neighbors(target):
-            if is_walkable(pos, state, extra_blocked):
+            if is_walkable(pos, state, extra_blocked, constrain_bridge=constrain_bridge):
                 goals.add(pos)
     return goals
 
@@ -257,7 +292,7 @@ def monster_goals(state: SymbolicState, extra_blocked: set[Position] | None = No
     return adjacent_walkable_goals(state, set(state.monsters), extra_blocked)
 
 
-def task1_exit_goals(state: SymbolicState) -> set[Position]:
+def fallback_exit_goals(state: SymbolicState) -> set[Position]:
     if state.exits:
         return {pos for pos in state.exits if in_bounds(pos)}
     return {(x, 0) for x in range(10) if is_walkable((x, 0), state)}
@@ -273,6 +308,30 @@ def side_exits(state: SymbolicState, action: int) -> set[Position]:
     if action == ACTION_DOWN:
         return {pos for pos in state.exits if pos[1] == 7}
     return set()
+
+
+def exit_alignment_action(
+    state: SymbolicState,
+    side: Side,
+    exits: set[Position] | None = None,
+) -> int | None:
+    """Return a short perpendicular correction toward a visible exit lane."""
+    entity = state.player_entity
+    target_exits = side_exits(state, SIDE_TO_ACTION[side]) if exits is None else exits
+    if entity is None or not target_exits:
+        return None
+
+    vertical_exit = side in {"up", "down"}
+    player_axis = entity.center_px[0] if vertical_exit else entity.center_px[1]
+    lane_indices = {position[0] if vertical_exit else position[1] for position in target_exits}
+    lane_centers = [index * TILE_SIZE + TILE_SIZE / 2.0 for index in lane_indices]
+    target_axis = min(lane_centers, key=lambda center: abs(center - player_axis))
+    offset = target_axis - player_axis
+    if abs(offset) <= EXIT_ALIGNMENT_TOLERANCE_PX:
+        return None
+    if vertical_exit:
+        return ACTION_RIGHT if offset > 0 else ACTION_LEFT
+    return ACTION_DOWN if offset > 0 else ACTION_UP
 
 
 def visible_exit_sides(state: SymbolicState) -> frozenset[Side]:
@@ -295,6 +354,17 @@ def bridge_connected_sides(state: SymbolicState, width: int = 10, height: int = 
         if x == 0:
             sides.add("left")
         if x == width - 1:
+            sides.add("right")
+    for exit_x, exit_y in state.exits:
+        if not any(manhattan((exit_x, exit_y), bridge) == 1 for bridge in state.bridges):
+            continue
+        if exit_y == 0:
+            sides.add("up")
+        if exit_y == height - 1:
+            sides.add("down")
+        if exit_x == 0:
+            sides.add("left")
+        if exit_x == width - 1:
             sides.add("right")
     return frozenset(sides)
 
@@ -323,38 +393,22 @@ def bridge_primary_side(state: SymbolicState, switch_side: Side | None = None) -
     return None
 
 
-def center_bridge_goals(state: SymbolicState) -> set[Position]:
-    anchor = center_bridge_anchor(state)
-    if anchor is None:
-        return set()
-    return adjacent_walkable_goals(state, {anchor})
-
-
-def center_bridge_anchor(state: SymbolicState) -> Position | None:
-    if not state.bridges:
-        return None
-    bridge_tiles = set(state.bridges)
-    xs = [x for x, _ in bridge_tiles]
-    ys = [y for _, y in bridge_tiles]
-    mid_x = sum(xs) / len(xs)
-    mid_y = sum(ys) / len(ys)
-    return min(
-        bridge_tiles,
-        key=lambda pos: (
-            -sum(neighbor in bridge_tiles for neighbor in neighbors(pos)),
-            abs(pos[0] - mid_x) + abs(pos[1] - mid_y),
-            pos[0],
-            pos[1],
-        ),
-    )
-
-
-def inventory_items(info: dict) -> tuple[str, ...]:
+def inventory_signature(info: dict) -> tuple[int, int, tuple[str, ...], tuple[str, ...]]:
     inventory = info.get("inventory", {}) if isinstance(info, dict) else {}
-    items = inventory.get("items", ())
-    if isinstance(items, (list, tuple, set)):
-        return tuple(str(item) for item in items)
-    return ()
+
+    def number(name: str) -> int:
+        try:
+            return int(inventory.get(name, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def names(name: str) -> tuple[str, ...]:
+        values = inventory.get(name, ())
+        if not isinstance(values, (list, tuple, set)):
+            return ()
+        return tuple(sorted(str(value) for value in values))
+
+    return number("keys"), number("gold"), names("items"), names("tools")
 
 
 def bfs_path(
@@ -398,6 +452,8 @@ def astar_path(
     extra_blocked: set[Position] | None = None,
     extra_unblocked: set[Position] | None = None,
     config: PlannerConfig | None = None,
+    *,
+    constrain_bridge: bool = True,
 ) -> list[Position] | None:
     config = DEFAULT_PLANNER_CONFIG if config is None else config
     start = state.player
@@ -406,7 +462,7 @@ def astar_path(
     if start in goals:
         return [start]
 
-    blocked = blocked_tiles(state, extra_blocked, extra_unblocked)
+    blocked = blocked_tiles(state, extra_blocked, extra_unblocked, constrain_bridge=constrain_bridge)
     danger = monster_danger_tiles(state)
     trap_neighbors = {pos for trap in state.traps | state.gaps for pos in neighbors(trap) if in_bounds(pos)}
 
@@ -560,14 +616,6 @@ def monster_danger_tiles(state: SymbolicState) -> set[Position]:
     return danger
 
 
-def inventory_keys(info: dict) -> int:
-    inventory = info.get("inventory", {}) if isinstance(info, dict) else {}
-    try:
-        return int(inventory.get("keys", 0))
-    except (TypeError, ValueError):
-        return 0
-
-
 class Policy:
     def __init__(self, perception_engine=None, config: PlannerConfig | None = None) -> None:
         if perception_engine is None:
@@ -576,16 +624,20 @@ class Policy:
             perception_engine = PerceptionEngine(device="cpu")
         self.perception_engine = perception_engine
         self.config = planner_config_from_env() if config is None else config
-        self.task_id: str | None = None
         self.pending_interaction: InteractionIntent | None = None
+        self.awaiting_interaction: InteractionAttempt | None = None
+        self.last_raw_state: SymbolicState | None = None
+        self.last_reward = 0.0
         self.committed_action: int | None = None
         self.committed_ticks_remaining = 0
         self.committed_target_tile: Position | None = None
         self.committed_target_seen_ticks = 0
+        self.committed_allow_exit = False
         self.remembered_blockers: set[Position] = set()
         self.hub_exploration_started = False
         self.current_target_side: Side | None = None
         self.switch_hub_side: Side | None = None
+        self.hub_switch_positions: set[Position] = set()
         self.pressed_switch_for_target = False
         self.explored_hub_sides: set[Side] = set()
         self.saw_monster_objective = False
@@ -595,23 +647,43 @@ class Policy:
         self.exit_memory: dict[tuple[str, Side], ExitMemory] = {}
         self.current_room_signature: str | None = None
         self.attempted_exit: tuple[str, Side] | None = None
+        self.global_planner_started = False
+        self.temporal_filter = TemporalSymbolicFilter()
+        self.inventory_revision = 0
+        self.last_inventory_signature: tuple[int, int, tuple[str, ...], tuple[str, ...]] | None = None
+        self.inventory_changed_this_step = False
+        self.hp_estimate = 5
         self.last_player_tile: Position | None = None
-        self.last_reliable_player_tile: Position | None = None
+        self.recent_player_tiles: deque[Position] = deque(maxlen=4)
         self.stuck_ticks = 0
+        self.hub_search_visits: dict[Position, int] = {}
+        self.hub_scanned_frontiers: dict[frozenset[Side], set[Position]] = {}
+        self.scanned_bridge_states: set[frozenset[Side]] = set()
+        self.post_goal_rotate_bridge = False
+        self.post_goal_switch_pressed = False
+        self.monster_absence_ticks = 0
+        self.combat_attack_pending = False
+        self.combat_progress_observed = False
         self.shield_cooldown = 0
+        self.recovery_forced_action: int | None = None
+        self.recovery_forced_allow_exit = False
 
     def reset(self, seed: int | None = None, task_id: str | None = None) -> None:
-        del seed
-        self.task_id = task_id
+        del seed, task_id
         self.pending_interaction = None
+        self.awaiting_interaction = None
+        self.last_raw_state = None
+        self.last_reward = 0.0
         self.committed_action = None
         self.committed_ticks_remaining = 0
         self.committed_target_tile = None
         self.committed_target_seen_ticks = 0
+        self.committed_allow_exit = False
         self.remembered_blockers = set()
         self.hub_exploration_started = False
         self.current_target_side = None
         self.switch_hub_side = None
+        self.hub_switch_positions = set()
         self.pressed_switch_for_target = False
         self.explored_hub_sides = set()
         self.saw_monster_objective = False
@@ -621,28 +693,45 @@ class Policy:
         self.exit_memory = {}
         self.current_room_signature = None
         self.attempted_exit = None
+        self.global_planner_started = False
+        self.temporal_filter.reset()
+        self.inventory_revision = 0
+        self.last_inventory_signature = None
+        self.inventory_changed_this_step = False
+        self.hp_estimate = 5
         self.last_player_tile = None
-        self.last_reliable_player_tile = None
+        self.recent_player_tiles = deque(maxlen=4)
         self.stuck_ticks = 0
+        self.hub_search_visits = {}
+        self.hub_scanned_frontiers = {}
+        self.scanned_bridge_states = set()
+        self.post_goal_rotate_bridge = False
+        self.post_goal_switch_pressed = False
+        self.monster_absence_ticks = 0
+        self.combat_attack_pending = False
+        self.combat_progress_observed = False
         self.shield_cooldown = 0
+        self.recovery_forced_action = None
+        self.recovery_forced_allow_exit = False
 
     def act(self, obs, info) -> int:
+        signature = inventory_signature(info)
+        keys, _, items, _ = signature
+        self._update_inventory_progress(signature)
+        self._update_resource_estimate(info)
+
         if self.committed_action is not None and self.committed_ticks_remaining > 0:
             state = self._extract_state(obs)
+            emergency_shield = self._emergency_shield_action(state)
+            if emergency_shield is not None:
+                return emergency_shield
             if self._committed_move_complete(state):
                 pass
-            elif self._stuck_recovery_action(state):
-                return ACTION_NOOP
             else:
-                task5_room_changed = False
-                if self.task_id == "mathematical_logic/task_5":
-                    current_kind = self._structural_room_signature(state, room_features(state))
-                    task5_room_changed = (
-                        current_kind != "unknown"
-                        and self.current_room_signature is not None
-                        and current_kind != self.current_room_signature
-                    )
-                if task5_room_changed or (self.task_id != "mathematical_logic/task_5" and self.hub_exploration_started and self._symbolic_room_changed(obs)):
+                recovery_action = self._stuck_recovery_action(state)
+                if recovery_action is not None:
+                    return recovery_action
+                if self._committed_room_changed(state):
                     self._clear_commit()
                 else:
                     self.committed_ticks_remaining -= 1
@@ -651,30 +740,160 @@ class Policy:
                         self._clear_commit()
                     return action
 
-        if self.committed_action is not None and self.committed_ticks_remaining > 0:
-            self.committed_ticks_remaining -= 1
-            action = self.committed_action
-            if self.committed_ticks_remaining == 0:
-                self._clear_commit()
-            return action
-
         state = self._extract_state(obs)
         self._update_stuck_counter(state)
         features = room_features(state)
-        keys = inventory_keys(info)
-        items = inventory_items(info)
 
-        if self.task_id == "mathematical_logic/task_5":
-            return self._act_task5(state, features, keys)
+        interaction_action = self._advance_interaction(state)
+        if interaction_action is not None:
+            return interaction_action
 
-        use_hub_exploration = self.task_id == "mathematical_logic/task_4" or (
-            self.task_id is None and (state.switches or state.bridges or self.hub_exploration_started)
-        )
+        forced_action = self._consume_recovery_forced_action(state)
+        if forced_action is not None:
+            return forced_action
+
+        if self._should_use_global_planner(features):
+            self.global_planner_started = True
+            return self._act_global_planner(state, features, keys)
+
+        switch_hub_signal = bool(state.switches and state.walls)
+        bridge_hub_signal = bool(state.bridges and state.gaps)
+        use_hub_exploration = switch_hub_signal or bridge_hub_signal or self.hub_exploration_started
         if use_hub_exploration:
             self.hub_exploration_started = True
-        return self._act_from_features(state, features, keys, items, use_hub_exploration)
+        return self._act_local_planner(state, features, keys, items, use_hub_exploration)
 
-    def _act_from_features(
+    def _should_use_global_planner(self, features: RoomFeatures) -> bool:
+        if self.global_planner_started:
+            return True
+        return features.has_button
+
+    def _update_inventory_progress(
+        self,
+        signature: tuple[int, int, tuple[str, ...], tuple[str, ...]],
+    ) -> None:
+        if self.last_inventory_signature is None:
+            self.last_inventory_signature = signature
+            self.inventory_changed_this_step = False
+            return
+        self.inventory_changed_this_step = signature != self.last_inventory_signature
+        if self.inventory_changed_this_step:
+            self.inventory_revision += 1
+            self.last_inventory_signature = signature
+
+    def _update_resource_estimate(self, info: dict) -> None:
+        if not isinstance(info, dict):
+            return
+        try:
+            last_reward = float(info.get("last_reward", 0.0))
+        except (TypeError, ValueError):
+            return
+        self.last_reward = last_reward
+        if self.combat_attack_pending:
+            self.combat_progress_observed = last_reward > 0.25
+            self.combat_attack_pending = False
+        if last_reward <= -1.0:
+            self.hp_estimate = max(1, self.hp_estimate - 1)
+        elif last_reward >= 2.0:
+            self.hp_estimate = min(5, self.hp_estimate + 1)
+
+    def _path_config(self) -> PlannerConfig:
+        if not self.global_planner_started:
+            return self.config
+        low_hp_pressure = max(0, 3 - self.hp_estimate)
+        if low_hp_pressure == 0:
+            return self.config
+        return replace(
+            self.config,
+            monster_danger_cost=self.config.monster_danger_cost + 3.0 * low_hp_pressure,
+            trap_neighbor_cost=self.config.trap_neighbor_cost + 2.0 * low_hp_pressure,
+        )
+
+    def _emergency_shield_action(self, state: SymbolicState) -> int | None:
+        if not self.global_planner_started:
+            return None
+        if self.committed_action not in ACTION_TO_DELTA:
+            return None
+
+        step = ACTION_TO_DELTA[self.committed_action]
+        next_tile = (state.player[0] + step[0], state.player[1] + step[1])
+        for monster in state.monsters:
+            distance = manhattan(state.player, monster)
+            moving_toward_monster = in_bounds(next_tile) and manhattan(next_tile, monster) < distance
+            if distance <= 1 or (distance <= self.config.shield_distance and moving_toward_monster):
+                self._clear_commit()
+                return ACTION_B
+        return None
+
+    def _advance_interaction(self, state: SymbolicState) -> int | None:
+        if self.awaiting_interaction is not None:
+            attempt = self.awaiting_interaction
+            if self._interaction_succeeded(attempt):
+                self._confirm_interaction(attempt.intent)
+                self.awaiting_interaction = None
+            else:
+                raw_state = self.last_raw_state or state
+                visible_targets = self._interaction_targets(raw_state, attempt.intent.kind)
+                if attempt.intent.target in visible_targets:
+                    self.awaiting_interaction = None
+                else:
+                    attempt.missing_frames += 1
+                    if attempt.missing_frames < INTERACTION_VISUAL_CONFIRM_TICKS:
+                        return ACTION_NOOP
+                    self._confirm_interaction(attempt.intent)
+                    self.awaiting_interaction = None
+
+        if self.pending_interaction is None:
+            return None
+
+        intent = self.pending_interaction
+        self.pending_interaction = None
+        raw_state = self.last_raw_state or state
+        if adjacent_action(raw_state.player, intent.target) != intent.action_to_face:
+            goals = adjacent_walkable_goals(raw_state, {intent.target}, self._current_room_blockers())
+            return self._move_to_goals(raw_state, goals, self.remembered_blockers)
+
+        if intent.kind in {"chest", "switch", "button"}:
+            self.awaiting_interaction = InteractionAttempt(intent, self.inventory_revision)
+        if intent.kind == "monster":
+            self.combat_attack_pending = True
+        return ACTION_A
+
+    def _interaction_succeeded(self, attempt: InteractionAttempt) -> bool:
+        return (
+            self.inventory_revision > attempt.inventory_revision
+            or self.last_reward >= INTERACTION_SUCCESS_REWARD
+        )
+
+    def _confirm_interaction(self, intent: InteractionIntent) -> None:
+        if intent.kind == "chest":
+            self.remembered_blockers.add(intent.target)
+            if self.current_room_signature is not None:
+                self.room_memory.setdefault(self.current_room_signature, RoomMemory()).opened_chests.add(intent.target)
+            return
+        if intent.kind == "switch":
+            self.pressed_switch_for_target = True
+            if self.monster_objective_done and self.post_goal_rotate_bridge:
+                self.post_goal_switch_pressed = True
+            return
+        if intent.kind == "button" and self.current_room_signature is not None:
+            memory = self.room_memory.setdefault(self.current_room_signature, RoomMemory())
+            memory.pressed_buttons.add(intent.target)
+            memory.interaction_done = True
+
+    @staticmethod
+    def _interaction_targets(state: SymbolicState, kind: InteractionKind) -> frozenset[Position]:
+        if kind == "chest":
+            return state.chests
+        if kind == "switch":
+            return state.switches
+        if kind == "button":
+            return state.buttons
+        if kind == "monster":
+            return state.monsters
+        return frozenset()
+
+    def _act_local_planner(
         self,
         state: SymbolicState,
         features: RoomFeatures,
@@ -682,60 +901,69 @@ class Policy:
         items: tuple[str, ...],
         use_hub_exploration: bool,
     ) -> int:
-        if self.pending_interaction is not None:
-            intent = self.pending_interaction
-            self.pending_interaction = None
-            if adjacent_action(state.player, intent.target) == intent.action_to_face:
-                if intent.kind == "chest":
-                    self.remembered_blockers.add(intent.target)
-                if intent.kind == "switch":
-                    self.pressed_switch_for_target = True
-                return ACTION_A
-
         if use_hub_exploration:
             room = self._room_signature(features)
             if room != "unknown" and room != self.last_room_signature:
                 self.remembered_blockers = set()
                 self.last_room_signature = room
 
-            self._remember_hub_context(features)
+            self._remember_hub_context(state, features)
             if state.player == (-1, -1):
                 fallback = self._missing_player_hub_action(state, keys, "sword" in items)
                 if fallback is not None:
                     return self._commit(fallback, TILE_MOVE_TICKS)
 
-            if state.monsters:
-                self.saw_monster_objective = True
-            if self.saw_monster_objective and not state.monsters and not features.has_bridge:
-                self.monster_objective_done = True
+            self._update_monster_progress(state, features)
 
         has_sword = "sword" in items
+        objective = self._choose_local_objective(
+            state,
+            features,
+            keys,
+            has_sword,
+            use_hub_exploration,
+        )
+        return self._execute_objective(state, objective)
 
+    def _choose_local_objective(
+        self,
+        state: SymbolicState,
+        features: RoomFeatures,
+        keys: int,
+        has_sword: bool,
+        use_hub_exploration: bool,
+    ) -> Objective:
         if state.monsters and (has_sword or not use_hub_exploration):
-            interact = self._interaction_if_adjacent(state, set(state.monsters), kind="monster")
-            if interact is not None:
-                self.pending_interaction = interact
-                return interact.action_to_face
-            return self._move_toward(state, monster_goals(state, self.remembered_blockers))
+            return Objective("fight", targets=state.monsters)
 
-        chest_targets = set(state.chests) - self.remembered_blockers
+        chest_targets = frozenset(set(state.chests) - self.remembered_blockers)
         if chest_targets and (keys <= 0 or use_hub_exploration):
-            interact = self._interaction_if_adjacent(state, chest_targets, kind="chest")
-            if interact is not None:
-                self.pending_interaction = interact
-                return interact.action_to_face
-            return self._move_toward(state, adjacent_walkable_goals(state, chest_targets, self.remembered_blockers))
+            return Objective(
+                "interact",
+                targets=chest_targets,
+                interaction_kind="chest",
+            )
 
         if use_hub_exploration:
-            hub_action = self._hub_exploration_action(state, features, keys, has_sword)
-            if hub_action is not None:
-                return hub_action
+            return self._choose_bridge_objective(state, features, keys, has_sword)
 
         exit_side = self._choose_visible_exit_side(state, keys)
         if exit_side is not None:
-            return self._go_to_side_via_approach(state, exit_side)
+            return Objective("go_exit", side=exit_side)
+        return Objective("navigate", targets=frozenset(fallback_exit_goals(state)))
 
-        return self._move_toward(state, task1_exit_goals(state))
+    def _update_monster_progress(self, state: SymbolicState, features: RoomFeatures) -> None:
+        if state.monsters:
+            self.saw_monster_objective = True
+            self.monster_absence_ticks = 0
+            return
+        if not self.saw_monster_objective or features.has_bridge or not self.combat_progress_observed:
+            self.monster_absence_ticks = 0
+            return
+
+        self.monster_absence_ticks += 1
+        if self.monster_absence_ticks >= 3:
+            self.monster_objective_done = True
 
     def _choose_visible_exit_side(self, state: SymbolicState, keys: int) -> Side | None:
         sides = visible_exit_sides(state)
@@ -747,96 +975,130 @@ class Policy:
                 return side
         return next(iter(sides))
 
-    def _hub_exploration_action(
+    def _choose_bridge_objective(
         self,
         state: SymbolicState,
         features: RoomFeatures,
         keys: int,
         has_sword: bool,
-    ) -> int | None:
+    ) -> Objective:
         is_hub_room = features.has_bridge or len(features.exit_sides) > 1
 
+        if is_hub_room and self.post_goal_switch_pressed:
+            self.post_goal_rotate_bridge = False
+            self.post_goal_switch_pressed = False
+
         if is_hub_room and self.monster_objective_done and state.chests:
-            return self._open_nearest_chest(state)
+            return Objective(
+                "interact",
+                targets=state.chests,
+                interaction_kind="chest",
+                search="astar",
+                constrain_bridge=False,
+            )
+
+        if is_hub_room and self.monster_objective_done and self.post_goal_rotate_bridge:
+            if self.switch_hub_side is None:
+                return Objective("idle")
+            return Objective("go_exit", side=self.switch_hub_side)
 
         if is_hub_room and self.monster_objective_done:
             search_goals = adjacent_walkable_goals(state, set(state.chests), self.remembered_blockers)
             if not search_goals and features.has_bridge:
-                anchor = center_bridge_anchor(state)
-                if anchor is not None:
-                    interact = self._interaction_if_adjacent(state, {anchor}, kind="chest")
-                    if interact is not None:
-                        self.pending_interaction = interact
-                        return interact.action_to_face
-                    search_goals = center_bridge_goals(state)
-            return self._move_toward(state, search_goals)
+                search_objective = self._bridge_frontier_objective(state)
+                if search_objective is not None:
+                    return search_objective
+                signature = bridge_connected_sides(state)
+                if signature in self.scanned_bridge_states or self.switch_hub_side is None:
+                    return Objective("idle")
+                self.scanned_bridge_states.add(signature)
+                self.post_goal_rotate_bridge = True
+                self.post_goal_switch_pressed = False
+                return Objective("go_exit", side=self.switch_hub_side)
+            return Objective("navigate", targets=frozenset(search_goals))
 
         if is_hub_room:
             target_side = self._choose_target_side(state, keys, has_sword)
             if target_side is None:
-                return ACTION_NOOP
+                return Objective("idle")
             reachable_sides = features.bridge_sides or features.exit_sides
             if target_side in reachable_sides:
                 self.pressed_switch_for_target = False
-                return self._go_to_side_via_approach(state, target_side)
+                return Objective("go_exit", side=target_side)
             switch_side = self.switch_hub_side or bridge_primary_side(state)
             self.pressed_switch_for_target = False
             if switch_side is None:
-                return ACTION_NOOP
-            return self._go_to_side_via_approach(state, switch_side)
+                return Objective("idle")
+            return Objective("go_exit", side=switch_side)
+
+        if self._is_known_switch_room(features) and self.monster_objective_done and self.post_goal_rotate_bridge:
+            if not self.post_goal_switch_pressed:
+                return self._switch_objective(state)
+            return self._center_exit_objective(state, features)
 
         if self._is_known_switch_room(features) and self.current_target_side is not None and not self.pressed_switch_for_target:
-            return self._press_switch(state)
+            return self._switch_objective(state)
 
         self._mark_current_side_explored(features)
-        return self._return_to_center(state, features)
+        return self._center_exit_objective(state, features)
 
-    def _symbolic_room_changed(self, obs) -> bool:
-        state = self._extract_state(obs)
-        room = self._room_signature(room_features(state))
-        return room != "unknown" and self.last_room_signature is not None and room != self.last_room_signature
+    def _bridge_frontier_objective(self, state: SymbolicState) -> Objective | None:
+        if state.player in state.bridges:
+            self.hub_search_visits[state.player] = self.hub_search_visits.get(state.player, 0) + 1
+
+        bridge_tiles = set(state.bridges)
+        frontier = {
+            tile
+            for tile in bridge_tiles
+            if is_walkable(tile, state, self.remembered_blockers)
+            and any(in_bounds(neighbor) and neighbor not in bridge_tiles for neighbor in neighbors(tile))
+            and not any(neighbor in state.exits for neighbor in neighbors(tile))
+        }
+        signature = bridge_connected_sides(state)
+        visited = self.hub_scanned_frontiers.setdefault(signature, set())
+        if state.player in frontier:
+            visited.add(state.player)
+        required_viewpoints = min(BRIDGE_SCAN_VIEWPOINTS, max(1, len(frontier)))
+        if len(visited) >= required_viewpoints:
+            return None
+        ordered = sorted(
+            frontier - visited,
+            key=lambda tile: (
+                self.hub_search_visits.get(tile, 0),
+                manhattan(state.player, tile),
+                tile,
+            ),
+        )
+        for target in ordered:
+            path = bfs_path(state, {target}, self.remembered_blockers)
+            if path is None or len(path) < 2:
+                continue
+            return Objective("navigate", targets=frozenset({target}))
+        return None
+
+    def _committed_room_changed(self, state: SymbolicState) -> bool:
+        features = room_features(state)
+        if self.global_planner_started:
+            room = self._structural_room_signature(state, features)
+            previous_room = self.current_room_signature
+        elif self.hub_exploration_started:
+            room = self._room_signature(features)
+            previous_room = self.last_room_signature
+        else:
+            return False
+        return room != "unknown" and previous_room is not None and room != previous_room
 
     def _extract_state(self, obs) -> SymbolicState:
         state = self.perception_engine.extract(obs)
-        return self._stabilize_player_tile(state)
-
-    def _stabilize_player_tile(self, state: SymbolicState) -> SymbolicState:
-        entity = state.player_entity
-        if entity is None:
-            self.last_reliable_player_tile = state.player
-            return state
-
-        center_tile = (
-            int(entity.center_px[0] // 16),
-            int(entity.center_px[1] // 16),
-        )
-        if not self._valid_player_tile(center_tile, state):
-            self.last_reliable_player_tile = state.player
-            return state
-
-        player = center_tile
-        if entity.confidence < 0.5 and self._valid_player_tile(state.player, state):
-            player = state.player
-        elif state.player in self._current_room_blockers() and center_tile not in self._current_room_blockers():
-            player = center_tile
-        if (
-            self.last_reliable_player_tile is not None
-            and manhattan(player, self.last_reliable_player_tile) > 3
-            and manhattan(center_tile, self.last_reliable_player_tile) <= 3
-        ):
-            player = center_tile
-
-        self.last_reliable_player_tile = player
-        if player == state.player and entity.tile == player:
-            return state
-        return replace(state, player=player, player_entity=replace(entity, tile=player))
-
-    def _valid_player_tile(self, tile: Position, state: SymbolicState) -> bool:
-        return (
-            in_bounds(tile)
-            and tile not in state.walls
-            and tile not in state.traps
-            and tile not in state.gaps
+        self.last_raw_state = state
+        return self.temporal_filter.update(
+            state,
+            inventory_changed=self.inventory_changed_this_step,
+            suppressed_chests=self._current_room_blockers(),
+            trust_consistent_player=(
+                self.pending_interaction is not None
+                or self.awaiting_interaction is not None
+            ),
         )
 
     def _missing_player_hub_action(self, state: SymbolicState, keys: int, has_sword: bool) -> int | None:
@@ -860,16 +1122,20 @@ class Policy:
             pieces.append("monster")
         return ",".join(pieces) if pieces else "unknown"
 
-    def _remember_hub_context(self, features: RoomFeatures) -> None:
+    def _remember_hub_context(self, state: SymbolicState, features: RoomFeatures) -> None:
         if self.switch_hub_side is None and features.has_switch and len(features.exit_sides) == 1:
             exit_side = next(iter(features.exit_sides))
             self.switch_hub_side = OPPOSITE_SIDE[exit_side]
+        if features.has_switch and self._is_known_switch_room(features):
+            self.hub_switch_positions.update(state.switches)
 
     def _is_known_switch_room(self, features: RoomFeatures) -> bool:
-        if not features.has_switch or len(features.exit_sides) != 1:
+        if len(features.exit_sides) != 1:
             return False
         center_side = OPPOSITE_SIDE[next(iter(features.exit_sides))]
-        return self.switch_hub_side is None or center_side == self.switch_hub_side
+        if self.switch_hub_side is not None:
+            return center_side == self.switch_hub_side
+        return features.has_switch
 
     def _mark_current_side_explored(self, features: RoomFeatures) -> None:
         if self._is_known_switch_room(features):
@@ -904,73 +1170,34 @@ class Policy:
             return side
         return active_side
 
-    def _open_nearest_chest(self, state: SymbolicState) -> int:
-        chest_targets = set(state.chests) - self.remembered_blockers
-        interact = self._interaction_if_adjacent(state, chest_targets, kind="chest")
-        if interact is not None:
-            self.pending_interaction = interact
-            return interact.action_to_face
-        return self._move_toward(state, adjacent_walkable_goals(state, chest_targets, self.remembered_blockers))
-
-    def _return_to_center(self, state: SymbolicState, features: RoomFeatures) -> int:
+    def _center_exit_objective(self, state: SymbolicState, features: RoomFeatures) -> Objective:
         if features.exit_sides:
             side = min(features.exit_sides, key=lambda candidate: len(side_exits(state, SIDE_TO_ACTION[candidate])))
-            return self._go_to_side_via_approach(state, side)
-        return self._move_toward(state, task1_exit_goals(state))
+            return Objective("go_exit", side=side)
+        return Objective("navigate", targets=frozenset(fallback_exit_goals(state)))
 
-    def _press_switch(self, state: SymbolicState) -> int:
-        targets = set(state.switches)
+    def _switch_objective(self, state: SymbolicState) -> Objective:
+        targets = frozenset(set(state.switches) or set(self.hub_switch_positions))
         if not targets:
-            return self._go_to_side_via_approach(state, "right")
-        interact = self._interaction_if_adjacent(state, targets, kind="switch")
-        if interact is not None:
-            self.pending_interaction = interact
-            return interact.action_to_face
-        return self._move_toward(state, adjacent_walkable_goals(state, targets, self.remembered_blockers))
+            return Objective("go_exit", side="right")
+        return Objective(
+            "interact",
+            targets=targets,
+            interaction_kind="switch",
+        )
 
-    def _act_task5(self, state: SymbolicState, features: RoomFeatures, keys: int) -> int:
+    def _act_global_planner(
+        self,
+        state: SymbolicState,
+        features: RoomFeatures,
+        keys: int,
+    ) -> int:
         if self.shield_cooldown > 0:
             self.shield_cooldown -= 1
 
         room_sig = self._update_memory(state, features)
-
-        if self.pending_interaction is not None:
-            intent = self.pending_interaction
-            self.pending_interaction = None
-            if adjacent_action(state.player, intent.target) == intent.action_to_face:
-                if intent.kind == "chest":
-                    self.remembered_blockers.add(intent.target)
-                    self.room_memory.setdefault(room_sig, RoomMemory()).opened_chests.add(intent.target)
-                if intent.kind == "button":
-                    self.room_memory.setdefault(room_sig, RoomMemory()).pressed_buttons.add(intent.target)
-                return ACTION_A
-
-        adjacent_monster = self._interaction_if_adjacent(state, set(state.monsters), kind="monster")
-        if adjacent_monster is not None:
-            chest_targets = set(state.chests) - self._opened_chests_for_current_room() - self.remembered_blockers
-            if any(manhattan(state.player, chest) == 1 for chest in chest_targets):
-                return ACTION_A
-            shield_action = self._shield_if_close(state)
-            if shield_action is not None:
-                return shield_action
-            self.pending_interaction = adjacent_monster
-            return adjacent_monster.action_to_face
-
-        shield_action = self._shield_if_close(state)
-        if shield_action is not None:
-            return shield_action
-
-        objective = self._choose_objective(state, features, keys, room_sig)
-        if objective.kind == "combat_chest":
-            return self._combat_chest_action(state, set(objective.targets))
-        if objective.kind == "open_chest":
-            return self._open_targets(state, set(objective.targets), "chest")
-        if objective.kind == "press_button":
-            return self._open_targets(state, set(objective.targets), "button")
-        if objective.kind == "go_exit" and objective.side is not None:
-            return self._go_to_side_via_approach(state, objective.side)
-
-        return self._move_toward(state, task1_exit_goals(state))
+        objective = self._choose_global_objective(state, features, keys, room_sig)
+        return self._execute_objective(state, objective)
 
     def _update_memory(self, state: SymbolicState, features: RoomFeatures) -> str:
         room_sig = self._structural_room_signature(state, features)
@@ -990,21 +1217,25 @@ class Policy:
 
         memory = self.room_memory.setdefault(room_sig, RoomMemory())
         memory.exits.update(features.exit_sides)
+        missing_known_chests = memory.known_chests - set(state.chests)
+        if self.inventory_changed_this_step:
+            memory.opened_chests.update(missing_known_chests)
         memory.known_chests.update(state.chests)
         memory.has_monster = memory.has_monster or features.has_monster
-        memory.has_trap = memory.has_trap or features.has_trap
-        memory.visits += 1
+        memory.has_button = memory.has_button or features.has_button
+        if memory.pressed_buttons:
+            memory.interaction_done = True
+        memory.visited_inventory_revisions.add(self.inventory_revision)
         return room_sig
 
     def _structural_room_signature(self, state: SymbolicState, features: RoomFeatures) -> str:
         pieces = [
             "exits=" + ",".join(sorted(features.exit_sides)),
             "walls=" + ",".join(f"{x}:{y}" for x, y in sorted(state.walls)),
-            "npc=" + ",".join(f"{x}:{y}" for x, y in sorted(npc_tiles(state))),
         ]
         return "|".join(pieces) if any(pieces) else "unknown"
 
-    def _choose_objective(
+    def _choose_global_objective(
         self,
         state: SymbolicState,
         features: RoomFeatures,
@@ -1013,28 +1244,51 @@ class Policy:
     ) -> Objective:
         memory = self.room_memory.setdefault(room_sig, RoomMemory())
         chest_targets = frozenset(set(state.chests) - memory.opened_chests - self.remembered_blockers)
-        if len(features.exit_sides) <= 1:
-            if chest_targets and state.monsters:
-                return Objective("combat_chest", chest_targets)
-            if chest_targets:
-                return Objective("open_chest", chest_targets)
-        else:
-            if chest_targets:
-                if state.monsters:
-                    return Objective("combat_chest", chest_targets)
-                return Objective("open_chest", chest_targets)
+        adjacent_monster = self._interaction_if_adjacent(state, set(state.monsters), kind="monster")
+        if adjacent_monster is not None:
+            if any(manhattan(state.player, chest) == 1 for chest in chest_targets):
+                return Objective(
+                    "interact",
+                    targets=chest_targets,
+                    interaction_kind="chest",
+                    search="astar",
+                    safe=True,
+                )
+            if self._shield_available(state):
+                return Objective("shield")
+            return Objective("fight", targets=state.monsters, search="astar", safe=True)
+
+        if self._shield_available(state):
+            return Objective("shield")
+
+        if chest_targets:
+            return Objective(
+                "interact",
+                targets=chest_targets,
+                interaction_kind="chest",
+                search="astar",
+                safe=bool(state.monsters),
+            )
 
         button_targets = frozenset(set(state.buttons) - memory.pressed_buttons)
         if button_targets:
-            return Objective("press_button", button_targets)
+            return Objective(
+                "interact",
+                targets=button_targets,
+                interaction_kind="button",
+                search="astar",
+            )
 
-        if len(features.exit_sides) == 1:
+        if len(features.exit_sides) == 1 and not self._current_room_needs_revisit(memory):
             return Objective("go_exit", side=next(iter(features.exit_sides)))
 
         side = self._choose_exploration_side(state, features, keys, room_sig)
         if side is not None:
             return Objective("go_exit", side=side)
-        return Objective("idle")
+        return Objective("navigate", targets=frozenset(fallback_exit_goals(state)))
+
+    def _current_room_needs_revisit(self, memory: RoomMemory) -> bool:
+        return self.inventory_revision not in memory.visited_inventory_revisions
 
     def _choose_exploration_side(
         self,
@@ -1065,7 +1319,7 @@ class Policy:
                 self._side_approach_goals(state, side, self._current_room_blockers()),
                 self._current_room_blockers() | (set(state.exits) - exits),
                 None,
-                self.config,
+                self._path_config(),
             )
             path_weight = 0.0 if keys > 0 and memory.status in {"unknown", "blocked"} else 1.0
             score += path_weight * float(len(path) if path else 100)
@@ -1093,7 +1347,10 @@ class Policy:
         room = self.room_memory.get(room_sig)
         if room is None:
             return True
-        return bool(room.known_chests - room.opened_chests)
+        return bool(
+            room.known_chests - room.opened_chests
+            or (room.has_button and not room.interaction_done)
+        )
 
     def _room_has_unknown_frontier(self, room_sig: str) -> bool:
         room = self.room_memory.get(room_sig)
@@ -1141,64 +1398,6 @@ class Policy:
 
         return fallback
 
-    def _combat_chest_action(self, state: SymbolicState, chest_targets: set[Position]) -> int:
-        for chest in sorted(chest_targets, key=lambda pos: manhattan(state.player, pos)):
-            if manhattan(state.player, chest) == 1:
-                self.pending_interaction = None
-                if self.current_room_signature is not None:
-                    self.room_memory.setdefault(self.current_room_signature, RoomMemory()).opened_chests.add(chest)
-                self.remembered_blockers.add(chest)
-                return ACTION_A
-
-        adjacent_monster = self._interaction_if_adjacent(state, set(state.monsters), kind="monster")
-        if adjacent_monster is not None:
-            shield_action = self._shield_if_close(state)
-            if shield_action is not None:
-                return shield_action
-            self.pending_interaction = adjacent_monster
-            return adjacent_monster.action_to_face
-
-        nearby_monster_distance = min((manhattan(state.player, monster) for monster in state.monsters), default=99)
-        if nearby_monster_distance <= self.config.shield_distance:
-            shield_action = self._shield_if_close(state)
-            if shield_action is not None:
-                return shield_action
-
-        chest_goals = adjacent_walkable_goals(state, chest_targets, self._current_room_blockers())
-        aligned_goals = {
-            goal
-            for goal in chest_goals
-            if goal[0] == state.player[0] or goal[1] == state.player[1]
-        }
-        path = astar_path(state, aligned_goals or chest_goals, self._current_room_blockers(), None, self.config)
-        if path is not None and len(path) >= 2:
-            target_tile = path[1] if path[1] not in state.exits else None
-            return self._commit(action_from_step(path[0], path[1]), TILE_MOVE_TICKS, target_tile=target_tile)
-
-        monster_targets = monster_goals(state, self._current_room_blockers())
-        path_to_monster = astar_path(state, monster_targets, self._current_room_blockers(), None, self.config)
-        if path_to_monster is not None and len(path_to_monster) >= 2:
-            target_tile = path_to_monster[1] if path_to_monster[1] not in state.exits else None
-            return self._commit(action_from_step(path_to_monster[0], path_to_monster[1]), TILE_MOVE_TICKS, target_tile=target_tile)
-        return ACTION_NOOP
-
-    def _open_targets(self, state: SymbolicState, targets: set[Position], kind: str) -> int:
-        if kind == "button":
-            if state.player in targets and self.current_room_signature is not None:
-                self.room_memory.setdefault(self.current_room_signature, RoomMemory()).pressed_buttons.add(state.player)
-                return ACTION_NOOP
-            path = astar_path(state, targets, self._current_room_blockers(), None, self.config)
-            if path is None or len(path) < 2:
-                return ACTION_NOOP
-            if path[1] in targets and self.current_room_signature is not None:
-                self.room_memory.setdefault(self.current_room_signature, RoomMemory()).pressed_buttons.add(path[1])
-            return self._commit(action_from_step(path[0], path[1]), TILE_MOVE_TICKS, target_tile=path[1])
-        interact = self._interaction_if_adjacent(state, targets, kind=kind)
-        if interact is not None:
-            self.pending_interaction = interact
-            return interact.action_to_face
-        return self._move_toward_astar(state, adjacent_walkable_goals(state, targets, self._current_room_blockers()))
-
     def _opened_chests_for_current_room(self) -> set[Position]:
         if self.current_room_signature is None:
             return set()
@@ -1215,28 +1414,45 @@ class Policy:
             return ACTION_B
         return None
 
+    def _shield_available(self, state: SymbolicState) -> bool:
+        return self.shield_cooldown <= 0 and any(
+            manhattan(state.player, monster) <= self.config.shield_distance
+            for monster in state.monsters
+        )
+
     def _go_to_side_via_approach(self, state: SymbolicState, side: Side) -> int:
         direction = SIDE_TO_ACTION[side]
         exits = side_exits(state, direction)
         if state.player in exits:
+            alignment = exit_alignment_action(state, side, exits)
+            if alignment is not None:
+                return self._commit(alignment, EXIT_ALIGNMENT_TICKS, allow_exit=True)
             if self.current_room_signature is not None:
                 self.attempted_exit = (self.current_room_signature, side)
-            return self._commit(direction, EXIT_MOVE_TICKS)
+            return self._commit(direction, EXIT_MOVE_TICKS, allow_exit=True)
         non_target_exits = set(state.exits) - exits
-        extra_blocked = self._current_room_blockers() | non_target_exits
+        extra_blocked = (self._current_room_blockers() - exits) | non_target_exits
         approach = self._side_approach_goals(state, side, extra_blocked)
 
         if state.player in approach:
+            alignment = exit_alignment_action(state, side, exits)
+            if alignment is not None:
+                return self._commit(alignment, EXIT_ALIGNMENT_TICKS, allow_exit=True)
             if self.current_room_signature is not None:
                 self.attempted_exit = (self.current_room_signature, side)
             dx, dy = ACTION_TO_DELTA[direction]
             target = (state.player[0] + dx, state.player[1] + dy)
             target_tile = target if in_bounds(target) and target not in state.exits else None
-            return self._commit(direction, TILE_MOVE_TICKS, target_tile=target_tile)
+            return self._commit(
+                direction,
+                TILE_MOVE_TICKS,
+                target_tile=target_tile,
+                allow_exit=True,
+            )
         preferred_approach = self._nearest_side_approach_goals(state, side, approach)
-        path = astar_path_to_side(state, preferred_approach, side, extra_blocked, None, self.config)
+        path = astar_path_to_side(state, preferred_approach, side, extra_blocked, None, self._path_config())
         if path is None and preferred_approach != approach:
-            path = astar_path_to_side(state, approach, side, extra_blocked, None, self.config)
+            path = astar_path_to_side(state, approach, side, extra_blocked, None, self._path_config())
         if path is None or len(path) < 2:
             return ACTION_NOOP
         if path[1] in non_target_exits:
@@ -1263,19 +1479,140 @@ class Policy:
     ) -> set[Position]:
         exits = side_exits(state, SIDE_TO_ACTION[side])
         if side == "up":
-            return {(x, 1) for x, _ in exits if is_walkable((x, 1), state, extra_blocked, extra_unblocked)}
+            return {
+                (x, 1)
+                for x, y in exits
+                if (x, y) not in (extra_blocked or set())
+                and is_walkable((x, 1), state, extra_blocked, extra_unblocked)
+            }
         if side == "down":
-            return {(x, 6) for x, _ in exits if is_walkable((x, 6), state, extra_blocked, extra_unblocked)}
+            return {
+                (x, 6)
+                for x, y in exits
+                if (x, y) not in (extra_blocked or set())
+                and is_walkable((x, 6), state, extra_blocked, extra_unblocked)
+            }
         if side == "left":
-            return {(1, y) for _, y in exits if is_walkable((1, y), state, extra_blocked, extra_unblocked)}
-        return {(8, y) for _, y in exits if is_walkable((8, y), state, extra_blocked, extra_unblocked)}
+            return {
+                (1, y)
+                for x, y in exits
+                if (x, y) not in (extra_blocked or set())
+                and is_walkable((1, y), state, extra_blocked, extra_unblocked)
+            }
+        return {
+            (8, y)
+            for x, y in exits
+            if (x, y) not in (extra_blocked or set())
+            and is_walkable((8, y), state, extra_blocked, extra_unblocked)
+        }
+
+    def _queue_interaction(self, intent: InteractionIntent) -> int:
+        self.pending_interaction = intent
+        return intent.action_to_face
+
+    def _execute_objective(self, state: SymbolicState, objective: Objective) -> int:
+        if objective.kind == "shield":
+            return self._shield_if_close(state) or ACTION_NOOP
+        if objective.kind == "fight":
+            return self._execute_fight(state, objective)
+        if objective.kind == "interact":
+            return self._execute_interaction(state, objective)
+        if objective.kind == "navigate":
+            return self._navigate_objective(state, objective)
+        if objective.kind == "go_exit" and objective.side is not None:
+            return self._go_to_side_via_approach(state, objective.side)
+        return ACTION_NOOP
+
+    def _execute_fight(self, state: SymbolicState, objective: Objective) -> int:
+        targets = set(objective.targets) or set(state.monsters)
+        interact = self._interaction_if_adjacent(state, targets, kind="monster")
+        if interact is not None:
+            if objective.safe:
+                shield_action = self._shield_if_close(state)
+                if shield_action is not None:
+                    return shield_action
+            return self._queue_interaction(interact)
+        if objective.safe:
+            shield_action = self._shield_if_close(state)
+            if shield_action is not None:
+                return shield_action
+        goals = monster_goals(state, self._objective_blockers(objective))
+        return self._navigate_objective(state, replace(objective, kind="navigate", targets=frozenset(goals)))
+
+    def _execute_interaction(self, state: SymbolicState, objective: Objective) -> int:
+        kind = objective.interaction_kind
+        targets = set(objective.targets)
+        if kind is None or not targets:
+            return ACTION_NOOP
+        if kind == "button":
+            if state.player in targets:
+                if self.current_room_signature is not None:
+                    self.room_memory.setdefault(
+                        self.current_room_signature,
+                        RoomMemory(),
+                    ).pressed_buttons.add(state.player)
+                return ACTION_NOOP
+            return self._navigate_objective(state, replace(objective, kind="navigate"))
+
+        interact = self._interaction_if_adjacent(state, targets, kind=kind)
+        if interact is not None:
+            return self._queue_interaction(interact)
+        if objective.safe:
+            shield_action = self._shield_if_close(state)
+            if shield_action is not None:
+                return shield_action
+        goals = adjacent_walkable_goals(
+            state,
+            targets,
+            self._objective_blockers(objective),
+            constrain_bridge=objective.constrain_bridge,
+        )
+        if objective.safe:
+            aligned_goals = {
+                goal
+                for goal in goals
+                if goal[0] == state.player[0] or goal[1] == state.player[1]
+            }
+            if aligned_goals:
+                goals = aligned_goals
+        action = self._navigate_objective(
+            state,
+            replace(objective, kind="navigate", targets=frozenset(goals)),
+        )
+        if action != ACTION_NOOP or not objective.safe or not state.monsters:
+            return action
+        return self._execute_fight(
+            state,
+            Objective(
+                "fight",
+                targets=state.monsters,
+                search=objective.search,
+                safe=True,
+            ),
+        )
+
+    def _navigate_objective(self, state: SymbolicState, objective: Objective) -> int:
+        goals = set(objective.targets)
+        blockers = self._objective_blockers(objective)
+        return self._move_to_goals(
+            state,
+            goals,
+            blockers,
+            search=objective.search,
+            constrain_bridge=objective.constrain_bridge,
+        )
+
+    def _objective_blockers(self, objective: Objective) -> set[Position]:
+        if objective.search == "astar":
+            return self._current_room_blockers()
+        return set(self.remembered_blockers)
 
     def _interaction_if_adjacent(
         self,
         state: SymbolicState,
         targets: set[Position],
         *,
-        kind: str,
+        kind: InteractionKind,
     ) -> InteractionIntent | None:
         if not targets:
             return None
@@ -1285,54 +1622,123 @@ class Policy:
             return None
         return InteractionIntent(target=target, action_to_face=face_action, kind=kind)
 
-    def _move_toward(
+    def _move_to_goals(
         self,
         state: SymbolicState,
         goals: set[Position],
-        extra_blocked: set[Position] | None = None,
+        blocked: set[Position],
+        *,
+        search: SearchMode = "bfs",
+        constrain_bridge: bool = True,
     ) -> int:
-        path = bfs_path(state, goals, self.remembered_blockers if extra_blocked is None else extra_blocked)
+        if search == "astar":
+            path = astar_path(
+                state,
+                goals,
+                blocked,
+                None,
+                self._path_config(),
+                constrain_bridge=constrain_bridge,
+            )
+        else:
+            path = bfs_path(state, goals, blocked)
         if path is None or len(path) < 2:
             return ACTION_NOOP
         target_tile = path[1] if path[1] not in state.exits else None
         return self._commit(action_from_step(path[0], path[1]), TILE_MOVE_TICKS, target_tile=target_tile)
 
-    def _move_toward_astar(
-        self,
-        state: SymbolicState,
-        goals: set[Position],
-        extra_blocked: set[Position] | None = None,
-    ) -> int:
-        path = astar_path(
-            state,
-            goals,
-            self._current_room_blockers() if extra_blocked is None else extra_blocked,
-            None,
-            self.config,
-        )
-        if path is None or len(path) < 2:
-            return ACTION_NOOP
-        target_tile = path[1] if path[1] not in state.exits else None
-        return self._commit(action_from_step(path[0], path[1]), TILE_MOVE_TICKS, target_tile=target_tile)
-
-    def _stuck_recovery_action(self, state: SymbolicState) -> bool:
+    def _stuck_recovery_action(self, state: SymbolicState) -> int | None:
         self._update_stuck_counter(state)
         if self.stuck_ticks < self.config.stuck_recovery_ticks or self.committed_action not in ACTION_TO_DELTA:
-            return False
+            return None
+        original_action = self.committed_action
+        original_allow_exit = self.committed_allow_exit
         dx, dy = ACTION_TO_DELTA[self.committed_action]
         blocker = (state.player[0] + dx, state.player[1] + dy)
-        if in_bounds(blocker):
+        visible_blockers = (
+            set(state.walls)
+            | set(state.traps)
+            | set(state.gaps)
+            | set(state.chests)
+            | set(state.monsters)
+            | npc_tiles(state)
+        )
+        if in_bounds(blocker) and blocker in visible_blockers:
             self.remembered_blockers.add(blocker)
+            self._clear_commit()
+            self.stuck_ticks = 0
+            self.recent_player_tiles.clear()
+            return ACTION_NOOP
+
+        if original_allow_exit:
+            side = ACTION_TO_SIDE[original_action]
+            alignment = exit_alignment_action(state, side)
+            if alignment is not None:
+                self._clear_commit()
+                self.stuck_ticks = 0
+                self.recent_player_tiles.clear()
+                return self._commit(alignment, EXIT_ALIGNMENT_TICKS, allow_exit=True)
+
+        recovery_actions = (
+            (ACTION_DOWN, ACTION_UP)
+            if self.committed_action in {ACTION_LEFT, ACTION_RIGHT}
+            else (ACTION_LEFT, ACTION_RIGHT)
+        )
         self._clear_commit()
         self.stuck_ticks = 0
-        return True
+        self.recent_player_tiles.clear()
+        for action in recovery_actions:
+            step = ACTION_TO_DELTA[action]
+            target = (state.player[0] + step[0], state.player[1] + step[1])
+            if not original_allow_exit and self._in_exit_buffer(target, state):
+                continue
+            if is_walkable(target, state, self._current_room_blockers()):
+                self.recovery_forced_action = original_action
+                self.recovery_forced_allow_exit = original_allow_exit
+                return self._commit(action, TILE_MOVE_TICKS, target_tile=target)
+        return ACTION_NOOP
+
+    def _consume_recovery_forced_action(self, state: SymbolicState) -> int | None:
+        if self.recovery_forced_action is None:
+            return None
+        action = self.recovery_forced_action
+        allow_exit = self.recovery_forced_allow_exit
+        self.recovery_forced_action = None
+        self.recovery_forced_allow_exit = False
+        step = ACTION_TO_DELTA.get(action)
+        if step is None:
+            return None
+        target = (state.player[0] + step[0], state.player[1] + step[1])
+        if not is_walkable(target, state, self._current_room_blockers()):
+            return None
+        if not allow_exit and self._in_exit_buffer(target, state):
+            return None
+        return self._commit(
+            action,
+            TILE_MOVE_TICKS,
+            target_tile=target,
+            allow_exit=allow_exit,
+        )
+
+    @staticmethod
+    def _in_exit_buffer(target: Position, state: SymbolicState) -> bool:
+        return any(manhattan(target, exit_tile) <= 1 for exit_tile in state.exits)
 
     def _update_stuck_counter(self, state: SymbolicState) -> None:
         if state.player == self.last_player_tile:
             self.stuck_ticks += 1
-        else:
-            self.last_player_tile = state.player
-            self.stuck_ticks = 0
+            return
+
+        self.last_player_tile = state.player
+        self.stuck_ticks = 0
+        self.recent_player_tiles.append(state.player)
+        if (
+            len(self.recent_player_tiles) == 4
+            and self.recent_player_tiles[0] == self.recent_player_tiles[2]
+            and self.recent_player_tiles[1] == self.recent_player_tiles[3]
+            and self.recent_player_tiles[0] != self.recent_player_tiles[1]
+        ):
+            self.stuck_ticks = self.config.stuck_recovery_ticks
 
     def _committed_move_complete(self, state: SymbolicState) -> bool:
         if self.committed_action not in ACTION_TO_DELTA or self.committed_target_tile is None:
@@ -1351,14 +1757,23 @@ class Policy:
         self.committed_ticks_remaining = 0
         self.committed_target_tile = None
         self.committed_target_seen_ticks = 0
+        self.committed_allow_exit = False
 
-    def _commit(self, action: int | None, ticks: int, target_tile: Position | None = None) -> int:
+    def _commit(
+        self,
+        action: int | None,
+        ticks: int,
+        target_tile: Position | None = None,
+        *,
+        allow_exit: bool = False,
+    ) -> int:
         if action is None:
             return ACTION_NOOP
         self.committed_action = action
         self.committed_ticks_remaining = max(0, ticks - 1)
         self.committed_target_tile = target_tile
         self.committed_target_seen_ticks = 0
+        self.committed_allow_exit = allow_exit
         return action
 
 
