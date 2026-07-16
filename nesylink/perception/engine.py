@@ -23,6 +23,7 @@ from nesylink.shared import EntityState, SymbolicState
 
 
 DEFAULT_WEIGHTS = Path(__file__).resolve().with_name("perception_model.pt")
+_CHEST_PALETTE = ((152, 82, 36), (255, 216, 80), (8, 8, 16))
 
 
 class PerceptionEngine:
@@ -63,7 +64,9 @@ class PerceptionEngine:
         )
         grid = prediction["grid"]
         opened_chest_tiles = set(prediction.get("opened_chests", ()))
-        closed_chest_tiles = set(prediction.get("closed_chests", _all_tiles(grid, TILE_CHEST)))
+        closed_chest_tiles = set(
+            prediction.get("closed_chests", _all_tiles(grid, TILE_CHEST))
+        ) | _detect_closed_chest_tiles(frame)
         detected_chest_tiles = opened_chest_tiles | closed_chest_tiles
         player_grid_tile = _first_tile(grid, TILE_PLAYER)
         monster_grid_tiles = _all_tiles(grid, TILE_MONSTER) - detected_chest_tiles
@@ -127,6 +130,55 @@ def _normalize_frame(obs: np.ndarray) -> np.ndarray:
     if frame.shape[0] > MAP_PIXEL_HEIGHT:
         frame = frame[:MAP_PIXEL_HEIGHT]
     return frame.astype(np.uint8, copy=False)
+
+
+def _detect_closed_chest_tiles(frame: np.ndarray) -> set[tuple[int, int]]:
+    """Recover closed chests whose sprite visually overrides another tile class."""
+    image = _normalize_frame(frame)
+    palettes = _supported_color_palettes(_CHEST_PALETTE)
+    detected: set[tuple[int, int]] = set()
+    rows = min(8, image.shape[0] // TILE_SIZE)
+    cols = min(10, image.shape[1] // TILE_SIZE)
+    for row in range(rows):
+        for col in range(cols):
+            tile = image[
+                row * TILE_SIZE : (row + 1) * TILE_SIZE,
+                col * TILE_SIZE : (col + 1) * TILE_SIZE,
+            ]
+            for wood, band, outline in palettes:
+                if (
+                    _color_fraction(tile[4:7, 2:7], band) >= 0.9
+                    and _color_fraction(tile[10:12, 3:13], wood) >= 0.9
+                    and _color_fraction(tile[12:13, 2:14], outline) >= 0.9
+                    and _color_fraction(tile[7:10, 7:9], band) >= 0.9
+                ):
+                    detected.add((col, row))
+                    break
+    return detected
+
+
+def _supported_color_palettes(
+    palette: tuple[tuple[int, int, int], ...],
+) -> tuple[tuple[tuple[int, int, int], ...], ...]:
+    colors = np.asarray(palette, dtype=np.float32)
+    variants = (
+        colors,
+        np.repeat(colors.mean(axis=1, keepdims=True), 3, axis=1),
+        colors * 0.55,
+        colors * 1.35,
+        np.where(colors > 127.0, 255.0, 0.0),
+        255.0 - colors,
+    )
+    return tuple(
+        tuple(tuple(int(channel) for channel in color) for color in np.clip(variant, 0, 255).astype(np.uint8))
+        for variant in variants
+    )
+
+
+def _color_fraction(patch: np.ndarray, color: tuple[int, int, int]) -> float:
+    if patch.size == 0:
+        return 0.0
+    return float(np.mean(np.all(patch == np.asarray(color, dtype=np.uint8), axis=2)))
 
 
 def _tile_from_center(center_px: tuple[float, float]) -> tuple[int, int]:

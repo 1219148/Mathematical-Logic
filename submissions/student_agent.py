@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from heapq import heappop, heappush
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from typing import Iterable, Literal
 
@@ -27,13 +27,18 @@ Side = Literal["up", "down", "left", "right"]
 ObjectiveKind = Literal["fight", "interact", "shield", "navigate", "go_exit", "idle"]
 InteractionKind = Literal["chest", "switch", "button", "monster"]
 SearchMode = Literal["bfs", "astar"]
+ExitType = Literal["unknown", "normal", "locked_key", "conditional"]
 TILE_MOVE_TICKS = 16
 EXIT_MOVE_TICKS = 24
 EXIT_ALIGNMENT_TICKS = 2
 EXIT_ALIGNMENT_TOLERANCE_PX = 1.0
+TILE_CENTER_TOLERANCE_PX = 0.5
 BRIDGE_SCAN_VIEWPOINTS = 1
 INTERACTION_SUCCESS_REWARD = 1.5
+BUTTON_SUCCESS_REWARD = 0.5
 INTERACTION_VISUAL_CONFIRM_TICKS = 5
+BLOCKED_ACTION_REWARD = -0.05
+BLOCKED_ACTION_REWARD_FLOOR = -0.5
 
 
 ACTION_TO_DELTA: dict[int, Position] = {
@@ -94,12 +99,14 @@ class RoomMemory:
     has_button: bool = False
     interaction_done: bool = False
     visited_inventory_revisions: set[int] = field(default_factory=set)
+    visit_count: int = 0
 
 
 @dataclass
 class ExitMemory:
     status: str = "unknown"
     leads_to: str | None = None
+    exit_type: ExitType = "unknown"
 
 
 @dataclass(frozen=True)
@@ -122,7 +129,7 @@ class PlannerConfig:
     blocked_exit_penalty: float = 50.0
     unfinished_room_bonus: float = 10.0
     completed_room_penalty: float = 15.0
-    target_tile_stable_ticks: int = 12
+    revisit_room_penalty: float = 4.0
     stuck_recovery_ticks: int = 24
     shield_distance: int = 2
     shield_cooldown_ticks: int = 18
@@ -161,7 +168,7 @@ def planner_config_from_env() -> PlannerConfig:
         blocked_exit_penalty=_env_float("NESYLINK_BLOCKED_EXIT_PENALTY", base.blocked_exit_penalty),
         unfinished_room_bonus=_env_float("NESYLINK_UNFINISHED_ROOM_BONUS", base.unfinished_room_bonus),
         completed_room_penalty=_env_float("NESYLINK_COMPLETED_ROOM_PENALTY", base.completed_room_penalty),
-        target_tile_stable_ticks=_env_int("NESYLINK_TARGET_TILE_STABLE_TICKS", base.target_tile_stable_ticks),
+        revisit_room_penalty=_env_float("NESYLINK_REVISIT_ROOM_PENALTY", base.revisit_room_penalty),
         stuck_recovery_ticks=_env_int("NESYLINK_STUCK_RECOVERY_TICKS", base.stuck_recovery_ticks),
         shield_distance=_env_int("NESYLINK_SHIELD_DISTANCE", base.shield_distance),
         shield_cooldown_ticks=_env_int("NESYLINK_SHIELD_COOLDOWN_TICKS", base.shield_cooldown_ticks),
@@ -340,6 +347,20 @@ def visible_exit_sides(state: SymbolicState) -> frozenset[Side]:
         for side, action in SIDE_TO_ACTION.items()
         if side_exits(state, action)
     )
+
+
+def exit_type_for_side(state: SymbolicState, side: Side) -> ExitType:
+    values = [
+        state.exit_types[position]
+        for position in side_exits(state, SIDE_TO_ACTION[side])
+        if state.exit_types.get(position) in {"normal", "locked_key", "conditional"}
+    ]
+    if not values:
+        return "unknown"
+    counts = Counter(values)
+    best_count = max(counts.values())
+    candidates = [name for name, count in counts.items() if count == best_count]
+    return candidates[0] if len(candidates) == 1 else "unknown"
 
 
 def bridge_connected_sides(state: SymbolicState, width: int = 10, height: int = 8) -> frozenset[Side]:
@@ -626,13 +647,15 @@ class Policy:
         self.config = planner_config_from_env() if config is None else config
         self.pending_interaction: InteractionIntent | None = None
         self.awaiting_interaction: InteractionAttempt | None = None
+        self.pending_button_target: Position | None = None
+        self.pending_button_room_signature: str | None = None
         self.last_raw_state: SymbolicState | None = None
         self.last_reward = 0.0
         self.committed_action: int | None = None
         self.committed_ticks_remaining = 0
         self.committed_target_tile: Position | None = None
-        self.committed_target_seen_ticks = 0
         self.committed_allow_exit = False
+        self.committed_exit_side: Side | None = None
         self.remembered_blockers: set[Position] = set()
         self.hub_exploration_started = False
         self.current_target_side: Side | None = None
@@ -647,6 +670,7 @@ class Policy:
         self.exit_memory: dict[tuple[str, Side], ExitMemory] = {}
         self.current_room_signature: str | None = None
         self.attempted_exit: tuple[str, Side] | None = None
+        self.attempted_exit_crossing = False
         self.global_planner_started = False
         self.temporal_filter = TemporalSymbolicFilter()
         self.inventory_revision = 0
@@ -667,18 +691,21 @@ class Policy:
         self.shield_cooldown = 0
         self.recovery_forced_action: int | None = None
         self.recovery_forced_allow_exit = False
+        self.recovery_forced_exit_side: Side | None = None
 
     def reset(self, seed: int | None = None, task_id: str | None = None) -> None:
         del seed, task_id
         self.pending_interaction = None
         self.awaiting_interaction = None
+        self.pending_button_target = None
+        self.pending_button_room_signature = None
         self.last_raw_state = None
         self.last_reward = 0.0
         self.committed_action = None
         self.committed_ticks_remaining = 0
         self.committed_target_tile = None
-        self.committed_target_seen_ticks = 0
         self.committed_allow_exit = False
+        self.committed_exit_side = None
         self.remembered_blockers = set()
         self.hub_exploration_started = False
         self.current_target_side = None
@@ -693,6 +720,7 @@ class Policy:
         self.exit_memory = {}
         self.current_room_signature = None
         self.attempted_exit = None
+        self.attempted_exit_crossing = False
         self.global_planner_started = False
         self.temporal_filter.reset()
         self.inventory_revision = 0
@@ -713,12 +741,14 @@ class Policy:
         self.shield_cooldown = 0
         self.recovery_forced_action = None
         self.recovery_forced_allow_exit = False
+        self.recovery_forced_exit_side = None
 
     def act(self, obs, info) -> int:
         signature = inventory_signature(info)
         keys, _, items, _ = signature
         self._update_inventory_progress(signature)
         self._update_resource_estimate(info)
+        state: SymbolicState | None = None
 
         if self.committed_action is not None and self.committed_ticks_remaining > 0:
             state = self._extract_state(obs)
@@ -740,7 +770,8 @@ class Policy:
                         self._clear_commit()
                     return action
 
-        state = self._extract_state(obs)
+        if state is None:
+            state = self._extract_state(obs)
         self._update_stuck_counter(state)
         features = room_features(state)
 
@@ -826,6 +857,8 @@ class Policy:
         return None
 
     def _advance_interaction(self, state: SymbolicState) -> int | None:
+        self._advance_button_interaction(state)
+
         if self.awaiting_interaction is not None:
             attempt = self.awaiting_interaction
             if self._interaction_succeeded(attempt):
@@ -858,6 +891,23 @@ class Policy:
         if intent.kind == "monster":
             self.combat_attack_pending = True
         return ACTION_A
+
+    def _advance_button_interaction(self, state: SymbolicState) -> None:
+        target = self.pending_button_target
+        if target is None:
+            return
+        raw_state = self.last_raw_state or state
+        reached_target = state.player == target or raw_state.player == target
+        if not reached_target and self.last_reward < BUTTON_SUCCESS_REWARD:
+            return
+
+        room_sig = self.pending_button_room_signature or self.current_room_signature
+        if room_sig is not None:
+            memory = self.room_memory.setdefault(room_sig, RoomMemory())
+            memory.pressed_buttons.add(target)
+            memory.interaction_done = True
+        self.pending_button_target = None
+        self.pending_button_room_signature = None
 
     def _interaction_succeeded(self, attempt: InteractionAttempt) -> bool:
         return (
@@ -970,10 +1020,22 @@ class Policy:
         if not sides:
             return None
         preferred = ("right", "left", "down", "up") if keys > 0 else ("left", "down", "right", "up")
-        for side in preferred:
-            if side in sides:
-                return side
-        return next(iter(sides))
+        direction_order = {side: index for index, side in enumerate(preferred)}
+        return min(
+            sides,
+            key=lambda side: (
+                self._visible_exit_type_priority(exit_type_for_side(state, side), keys),
+                direction_order[side],
+            ),
+        )
+
+    @staticmethod
+    def _visible_exit_type_priority(exit_type: ExitType, keys: int) -> int:
+        if exit_type == "locked_key":
+            return 0 if keys > 0 else 3
+        if exit_type == "normal":
+            return 1 if keys > 0 else 0
+        return 2 if keys > 0 else 1
 
     def _choose_bridge_objective(
         self,
@@ -1095,10 +1157,6 @@ class Policy:
             state,
             inventory_changed=self.inventory_changed_this_step,
             suppressed_chests=self._current_room_blockers(),
-            trust_consistent_player=(
-                self.pending_interaction is not None
-                or self.awaiting_interaction is not None
-            ),
         )
 
     def _missing_player_hub_action(self, state: SymbolicState, keys: int, has_sword: bool) -> int | None:
@@ -1201,22 +1259,45 @@ class Policy:
 
     def _update_memory(self, state: SymbolicState, features: RoomFeatures) -> str:
         room_sig = self._structural_room_signature(state, features)
+        entered_room = self.current_room_signature is None
         if self.current_room_signature is None:
             self.current_room_signature = room_sig
         elif room_sig != self.current_room_signature:
+            entered_room = True
             if self.attempted_exit is not None:
-                self.exit_memory[self.attempted_exit] = ExitMemory(status="open", leads_to=room_sig)
+                source_room, source_side = self.attempted_exit
+                forward = self.exit_memory.setdefault(self.attempted_exit, ExitMemory())
+                forward.status = "open"
+                forward.leads_to = room_sig
+
+                reverse_side = OPPOSITE_SIDE[source_side]
+                if reverse_side in features.exit_sides:
+                    reverse = self.exit_memory.setdefault((room_sig, reverse_side), ExitMemory())
+                    if reverse.leads_to in {None, source_room}:
+                        reverse.status = "open"
+                        reverse.leads_to = source_room
             self.current_room_signature = room_sig
             self.remembered_blockers = set()
-            self.attempted_exit = None
+            self._clear_exit_attempt()
         elif self.attempted_exit is not None and self.committed_action is None:
-            memory = self.exit_memory.setdefault(self.attempted_exit, ExitMemory())
-            if memory.status == "unknown":
-                memory.status = "blocked"
-            self.attempted_exit = None
+            _, attempted_side = self.attempted_exit
+            attempted_tiles = side_exits(state, SIDE_TO_ACTION[attempted_side])
+            if self.attempted_exit_crossing and self._blocked_exit_evidence():
+                memory = self.exit_memory.setdefault(self.attempted_exit, ExitMemory())
+                if memory.status == "unknown":
+                    memory.status = "blocked"
+                self._clear_exit_attempt()
+            elif state.player not in attempted_tiles:
+                self._clear_exit_attempt()
 
         memory = self.room_memory.setdefault(room_sig, RoomMemory())
+        if entered_room:
+            memory.visit_count += 1
         memory.exits.update(features.exit_sides)
+        for side in features.exit_sides:
+            observed_type = exit_type_for_side(state, side)
+            if observed_type != "unknown":
+                self.exit_memory.setdefault((room_sig, side), ExitMemory()).exit_type = observed_type
         missing_known_chests = memory.known_chests - set(state.chests)
         if self.inventory_changed_this_step:
             memory.opened_chests.update(missing_known_chests)
@@ -1227,6 +1308,13 @@ class Policy:
             memory.interaction_done = True
         memory.visited_inventory_revisions.add(self.inventory_revision)
         return room_sig
+
+    def _blocked_exit_evidence(self) -> bool:
+        return BLOCKED_ACTION_REWARD_FLOOR < self.last_reward <= BLOCKED_ACTION_REWARD
+
+    def _clear_exit_attempt(self) -> None:
+        self.attempted_exit = None
+        self.attempted_exit_crossing = False
 
     def _structural_room_signature(self, state: SymbolicState, features: RoomFeatures) -> str:
         pieces = [
@@ -1298,15 +1386,25 @@ class Policy:
         room_sig: str,
     ) -> Side | None:
         candidates: list[tuple[int, float, int, Side]] = []
+        room = self.room_memory.setdefault(room_sig, RoomMemory())
+        conditional_ready = (
+            room.interaction_done
+            or (room.has_monster and not state.monsters)
+            or self.inventory_changed_this_step
+        )
         for order, side in enumerate(SIDE_ORDER):
             if side not in features.exit_sides:
                 continue
-            memory = self.exit_memory.get((room_sig, side), ExitMemory())
-            priority = self._exit_objective_priority(memory, keys)
+            memory = self.exit_memory.setdefault((room_sig, side), ExitMemory())
+            observed_type = exit_type_for_side(state, side)
+            if observed_type != "unknown":
+                memory.exit_type = observed_type
+            retry_ready = self._exit_retry_ready(memory, keys, conditional_ready)
+            priority = self._exit_objective_priority(memory, keys, conditional_ready)
             score = 0.0
             if memory.status == "unknown":
                 score -= self.config.unknown_exit_bonus
-            elif memory.status == "blocked" and keys > 0:
+            elif memory.status == "blocked" and retry_ready:
                 score -= self.config.key_blocked_retry_bonus
             elif memory.status == "blocked":
                 score += self.config.blocked_exit_penalty
@@ -1321,27 +1419,50 @@ class Policy:
                 None,
                 self._path_config(),
             )
-            path_weight = 0.0 if keys > 0 and memory.status in {"unknown", "blocked"} else 1.0
+            path_weight = 0.0 if retry_ready and memory.status in {"unknown", "blocked"} else 1.0
             score += path_weight * float(len(path) if path else 100)
             candidates.append((priority, score, order, side))
         if not candidates:
             return None
         return min(candidates)[3]
 
-    def _exit_objective_priority(self, memory: ExitMemory, keys: int) -> int:
-        if memory.status == "blocked" and keys > 0:
-            return 0
+    def _exit_objective_priority(
+        self,
+        memory: ExitMemory,
+        keys: int,
+        conditional_ready: bool,
+    ) -> int:
         if memory.status == "open" and memory.leads_to is not None:
             if self._room_has_unfinished_goal(memory.leads_to):
                 return 1
             if self._room_has_unknown_frontier(memory.leads_to):
                 return 2
             return 5
+        if memory.exit_type == "locked_key":
+            return 0 if keys > 0 else 7
+        if memory.exit_type == "conditional":
+            if conditional_ready:
+                return 0
+            return 4 if memory.status == "unknown" else 6
+        if memory.status == "blocked" and keys > 0 and memory.exit_type == "unknown":
+            return 0
         if memory.status == "unknown":
             return 3
         if memory.status == "blocked":
             return 6
         return 4
+
+    @staticmethod
+    def _exit_retry_ready(
+        memory: ExitMemory,
+        keys: int,
+        conditional_ready: bool,
+    ) -> bool:
+        if memory.exit_type == "locked_key":
+            return keys > 0
+        if memory.exit_type == "conditional":
+            return conditional_ready
+        return memory.exit_type == "unknown" and keys > 0
 
     def _room_has_unfinished_goal(self, room_sig: str) -> bool:
         room = self.room_memory.get(room_sig)
@@ -1364,7 +1485,12 @@ class Policy:
     def _global_room_score(self, start_room: str) -> float:
         frontier: list[tuple[float, str]] = [(0.0, start_room)]
         best: dict[str, float] = {start_room: 0.0}
-        fallback = self.config.completed_room_penalty
+        start_memory = self.room_memory.get(start_room)
+        revisit_count = 0 if start_memory is None else max(0, start_memory.visit_count - 1)
+        fallback = (
+            self.config.completed_room_penalty
+            + self.config.revisit_room_penalty * revisit_count
+        )
 
         while frontier:
             distance, room_sig = heappop(frontier)
@@ -1426,10 +1552,21 @@ class Policy:
         if state.player in exits:
             alignment = exit_alignment_action(state, side, exits)
             if alignment is not None:
-                return self._commit(alignment, EXIT_ALIGNMENT_TICKS, allow_exit=True)
+                return self._commit(
+                    alignment,
+                    EXIT_ALIGNMENT_TICKS,
+                    allow_exit=True,
+                    exit_side=side,
+                )
             if self.current_room_signature is not None:
                 self.attempted_exit = (self.current_room_signature, side)
-            return self._commit(direction, EXIT_MOVE_TICKS, allow_exit=True)
+                self.attempted_exit_crossing = True
+            return self._commit(
+                direction,
+                EXIT_MOVE_TICKS,
+                allow_exit=True,
+                exit_side=side,
+            )
         non_target_exits = set(state.exits) - exits
         extra_blocked = (self._current_room_blockers() - exits) | non_target_exits
         approach = self._side_approach_goals(state, side, extra_blocked)
@@ -1437,9 +1574,15 @@ class Policy:
         if state.player in approach:
             alignment = exit_alignment_action(state, side, exits)
             if alignment is not None:
-                return self._commit(alignment, EXIT_ALIGNMENT_TICKS, allow_exit=True)
+                return self._commit(
+                    alignment,
+                    EXIT_ALIGNMENT_TICKS,
+                    allow_exit=True,
+                    exit_side=side,
+                )
             if self.current_room_signature is not None:
                 self.attempted_exit = (self.current_room_signature, side)
+                self.attempted_exit_crossing = False
             dx, dy = ACTION_TO_DELTA[direction]
             target = (state.player[0] + dx, state.player[1] + dy)
             target_tile = target if in_bounds(target) and target not in state.exits else None
@@ -1448,6 +1591,7 @@ class Policy:
                 TILE_MOVE_TICKS,
                 target_tile=target_tile,
                 allow_exit=True,
+                exit_side=side,
             )
         preferred_approach = self._nearest_side_approach_goals(state, side, approach)
         path = astar_path_to_side(state, preferred_approach, side, extra_blocked, None, self._path_config())
@@ -1459,7 +1603,12 @@ class Policy:
             self.remembered_blockers.add(path[1])
             return ACTION_NOOP
         target_tile = path[1] if path[1] not in state.exits else None
-        return self._commit(action_from_step(path[0], path[1]), TILE_MOVE_TICKS, target_tile=target_tile)
+        return self._commit(
+            action_from_step(path[0], path[1]),
+            TILE_MOVE_TICKS,
+            target_tile=target_tile,
+            exit_side=side,
+        )
 
     def _nearest_side_approach_goals(self, state: SymbolicState, side: Side, approach: set[Position]) -> set[Position]:
         if not approach:
@@ -1536,7 +1685,7 @@ class Policy:
             shield_action = self._shield_if_close(state)
             if shield_action is not None:
                 return shield_action
-        goals = monster_goals(state, self._objective_blockers(objective))
+        goals = monster_goals(state, self._objective_blockers(state, objective))
         return self._navigate_objective(state, replace(objective, kind="navigate", targets=frozenset(goals)))
 
     def _execute_interaction(self, state: SymbolicState, objective: Objective) -> int:
@@ -1545,14 +1694,16 @@ class Policy:
         if kind is None or not targets:
             return ACTION_NOOP
         if kind == "button":
+            target = min(targets, key=lambda position: manhattan(state.player, position))
+            self.pending_button_target = target
+            self.pending_button_room_signature = self.current_room_signature
             if state.player in targets:
-                if self.current_room_signature is not None:
-                    self.room_memory.setdefault(
-                        self.current_room_signature,
-                        RoomMemory(),
-                    ).pressed_buttons.add(state.player)
+                self._advance_button_interaction(state)
                 return ACTION_NOOP
-            return self._navigate_objective(state, replace(objective, kind="navigate"))
+            return self._navigate_objective(
+                state,
+                replace(objective, kind="navigate", targets=frozenset({target})),
+            )
 
         interact = self._interaction_if_adjacent(state, targets, kind=kind)
         if interact is not None:
@@ -1564,7 +1715,7 @@ class Policy:
         goals = adjacent_walkable_goals(
             state,
             targets,
-            self._objective_blockers(objective),
+            self._objective_blockers(state, objective),
             constrain_bridge=objective.constrain_bridge,
         )
         if objective.safe:
@@ -1593,7 +1744,7 @@ class Policy:
 
     def _navigate_objective(self, state: SymbolicState, objective: Objective) -> int:
         goals = set(objective.targets)
-        blockers = self._objective_blockers(objective)
+        blockers = self._objective_blockers(state, objective)
         return self._move_to_goals(
             state,
             goals,
@@ -1602,10 +1753,12 @@ class Policy:
             constrain_bridge=objective.constrain_bridge,
         )
 
-    def _objective_blockers(self, objective: Objective) -> set[Position]:
+    def _objective_blockers(self, state: SymbolicState, objective: Objective) -> set[Position]:
         if objective.search == "astar":
-            return self._current_room_blockers()
-        return set(self.remembered_blockers)
+            blockers = self._current_room_blockers()
+        else:
+            blockers = set(self.remembered_blockers)
+        return blockers | set(state.exits)
 
     def _interaction_if_adjacent(
         self,
@@ -1653,6 +1806,7 @@ class Policy:
             return None
         original_action = self.committed_action
         original_allow_exit = self.committed_allow_exit
+        original_exit_side = self.committed_exit_side
         dx, dy = ACTION_TO_DELTA[self.committed_action]
         blocker = (state.player[0] + dx, state.player[1] + dy)
         visible_blockers = (
@@ -1670,18 +1824,48 @@ class Policy:
             self.recent_player_tiles.clear()
             return ACTION_NOOP
 
+        if (
+            not original_allow_exit
+            and in_bounds(blocker)
+            and self.last_reward <= BLOCKED_ACTION_REWARD
+        ):
+            self.remembered_blockers.add(blocker)
+            self._clear_commit()
+            self.stuck_ticks = 0
+            self.recent_player_tiles.clear()
+            return ACTION_NOOP
+
         if original_allow_exit:
-            side = ACTION_TO_SIDE[original_action]
+            side = original_exit_side or ACTION_TO_SIDE[original_action]
             alignment = exit_alignment_action(state, side)
             if alignment is not None:
                 self._clear_commit()
                 self.stuck_ticks = 0
                 self.recent_player_tiles.clear()
-                return self._commit(alignment, EXIT_ALIGNMENT_TICKS, allow_exit=True)
+                return self._commit(
+                    alignment,
+                    EXIT_ALIGNMENT_TICKS,
+                    allow_exit=True,
+                    exit_side=side,
+                )
+            if state.player in side_exits(state, SIDE_TO_ACTION[side]):
+                self._clear_commit()
+                self.stuck_ticks = 0
+                self.recent_player_tiles.clear()
+                return self._commit(
+                    SIDE_TO_ACTION[side],
+                    EXIT_MOVE_TICKS,
+                    allow_exit=True,
+                    exit_side=side,
+                )
+            recovery_basis = SIDE_TO_ACTION[side]
+        else:
+            side = None
+            recovery_basis = original_action
 
         recovery_actions = (
             (ACTION_DOWN, ACTION_UP)
-            if self.committed_action in {ACTION_LEFT, ACTION_RIGHT}
+            if recovery_basis in {ACTION_LEFT, ACTION_RIGHT}
             else (ACTION_LEFT, ACTION_RIGHT)
         )
         self._clear_commit()
@@ -1693,8 +1877,9 @@ class Policy:
             if not original_allow_exit and self._in_exit_buffer(target, state):
                 continue
             if is_walkable(target, state, self._current_room_blockers()):
-                self.recovery_forced_action = original_action
+                self.recovery_forced_action = SIDE_TO_ACTION[side] if side is not None else original_action
                 self.recovery_forced_allow_exit = original_allow_exit
+                self.recovery_forced_exit_side = side
                 return self._commit(action, TILE_MOVE_TICKS, target_tile=target)
         return ACTION_NOOP
 
@@ -1703,8 +1888,10 @@ class Policy:
             return None
         action = self.recovery_forced_action
         allow_exit = self.recovery_forced_allow_exit
+        exit_side = self.recovery_forced_exit_side
         self.recovery_forced_action = None
         self.recovery_forced_allow_exit = False
+        self.recovery_forced_exit_side = None
         step = ACTION_TO_DELTA.get(action)
         if step is None:
             return None
@@ -1718,6 +1905,7 @@ class Policy:
             TILE_MOVE_TICKS,
             target_tile=target,
             allow_exit=allow_exit,
+            exit_side=exit_side,
         )
 
     @staticmethod
@@ -1744,11 +1932,13 @@ class Policy:
         if self.committed_action not in ACTION_TO_DELTA or self.committed_target_tile is None:
             return False
         if state.player != self.committed_target_tile:
-            self.committed_target_seen_ticks = 0
             return False
-        self.committed_target_seen_ticks += 1
-        if self.committed_target_seen_ticks < self.config.target_tile_stable_ticks:
-            return False
+        entity = state.player_entity
+        if entity is not None:
+            axis = 0 if self.committed_action in {ACTION_LEFT, ACTION_RIGHT} else 1
+            target_center = (self.committed_target_tile[axis] + 0.5) * TILE_SIZE
+            if abs(entity.center_px[axis] - target_center) > TILE_CENTER_TOLERANCE_PX:
+                return False
         self._clear_commit()
         return True
 
@@ -1756,8 +1946,8 @@ class Policy:
         self.committed_action = None
         self.committed_ticks_remaining = 0
         self.committed_target_tile = None
-        self.committed_target_seen_ticks = 0
         self.committed_allow_exit = False
+        self.committed_exit_side = None
 
     def _commit(
         self,
@@ -1766,14 +1956,15 @@ class Policy:
         target_tile: Position | None = None,
         *,
         allow_exit: bool = False,
+        exit_side: Side | None = None,
     ) -> int:
         if action is None:
             return ACTION_NOOP
         self.committed_action = action
         self.committed_ticks_remaining = max(0, ticks - 1)
         self.committed_target_tile = target_tile
-        self.committed_target_seen_ticks = 0
         self.committed_allow_exit = allow_exit
+        self.committed_exit_side = exit_side
         return action
 
 

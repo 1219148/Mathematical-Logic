@@ -113,6 +113,7 @@ class TinyPerceptionCNN(_BaseTorchModule()):
             nn.ReLU(inplace=True),
             nn.Conv2d(64, num_exit_type_classes, kernel_size=1),
         )
+        self.exit_type_head_available = True
         self.chest_state_head = nn.Sequential(
             nn.AdaptiveAvgPool2d((GRID_HEIGHT, GRID_WIDTH)),
             nn.Conv2d(96, 64, kernel_size=3, padding=1),
@@ -710,6 +711,9 @@ def load_model(weights_path: str | Path = DEFAULT_WEIGHTS, *, device: str | None
         for name in incompatible.missing_keys
         if name.startswith("exit_type_head.") or name.startswith("chest_state_head.")
     }
+    model.exit_type_head_available = not any(
+        name.startswith("exit_type_head.") for name in incompatible.missing_keys
+    )
     model.has_trained_chest_state_head = not any(
         name.startswith("chest_state_head.") for name in incompatible.missing_keys
     )
@@ -763,7 +767,7 @@ def predict_frame(
     with torch.no_grad():
         output = model(tensor)
         grid = output["tile_logits"].argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
-        if "exit_type_logits" in output:
+        if model.exit_type_head_available and "exit_type_logits" in output:
             exit_type_grid = output["exit_type_logits"].argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
         else:
             exit_type_grid = _fallback_exit_type_grids(grid[None, ...])[0]
