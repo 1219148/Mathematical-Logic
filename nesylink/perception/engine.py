@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +22,6 @@ from nesylink.shared import EntityState, SymbolicState
 
 
 DEFAULT_WEIGHTS = Path(__file__).resolve().with_name("perception_model.pt")
-_CHEST_PALETTE = ((152, 82, 36), (255, 216, 80), (8, 8, 16))
 
 
 class PerceptionEngine:
@@ -64,29 +62,32 @@ class PerceptionEngine:
         )
         grid = prediction["grid"]
         opened_chest_tiles = set(prediction.get("opened_chests", ()))
-        closed_chest_tiles = set(
-            prediction.get("closed_chests", _all_tiles(grid, TILE_CHEST))
-        ) | _detect_closed_chest_tiles(frame)
+        closed_chest_tiles = set(prediction.get("closed_chests", _all_tiles(grid, TILE_CHEST)))
         detected_chest_tiles = opened_chest_tiles | closed_chest_tiles
+        npc_tiles = _all_tiles(grid, TILE_NPC)
         player_grid_tile = _first_tile(grid, TILE_PLAYER)
         monster_grid_tiles = _all_tiles(grid, TILE_MONSTER) - detected_chest_tiles
 
         player_entity = _entity_from_detection(prediction.get("player"), "player")
-        if player_entity is not None and player_grid_tile is not None:
-            player_entity = replace(player_entity, tile=player_grid_tile)
         monster_entities = tuple(
-            _snap_entity_to_grid(entity, monster_grid_tiles)
+            entity
             for detection in prediction.get("monsters", ())
             if (entity := _entity_from_detection(detection, "monster")) is not None
             and entity.tile not in detected_chest_tiles
+            and entity.tile not in npc_tiles
         )
 
-        player_tile = player_grid_tile
+        player_tile = player_entity.tile if player_entity is not None else player_grid_tile
         if player_tile is None:
-            player_tile = player_entity.tile if player_entity is not None else (-1, -1)
+            player_tile = (-1, -1)
 
         monster_tiles = {entity.tile for entity in monster_entities}
-        monster_tiles.update(monster_grid_tiles)
+        monster_tiles.update(
+            tile
+            for tile in monster_grid_tiles
+            if not monster_entities
+            or all(_tile_manhattan(tile, entity.tile) > 1 for entity in monster_entities)
+        )
 
         return SymbolicState(
             player=player_tile,
@@ -132,57 +133,12 @@ def _normalize_frame(obs: np.ndarray) -> np.ndarray:
     return frame.astype(np.uint8, copy=False)
 
 
-def _detect_closed_chest_tiles(frame: np.ndarray) -> set[tuple[int, int]]:
-    """Recover closed chests whose sprite visually overrides another tile class."""
-    image = _normalize_frame(frame)
-    palettes = _supported_color_palettes(_CHEST_PALETTE)
-    detected: set[tuple[int, int]] = set()
-    rows = min(8, image.shape[0] // TILE_SIZE)
-    cols = min(10, image.shape[1] // TILE_SIZE)
-    for row in range(rows):
-        for col in range(cols):
-            tile = image[
-                row * TILE_SIZE : (row + 1) * TILE_SIZE,
-                col * TILE_SIZE : (col + 1) * TILE_SIZE,
-            ]
-            for wood, band, outline in palettes:
-                if (
-                    _color_fraction(tile[4:7, 2:7], band) >= 0.9
-                    and _color_fraction(tile[10:12, 3:13], wood) >= 0.9
-                    and _color_fraction(tile[12:13, 2:14], outline) >= 0.9
-                    and _color_fraction(tile[7:10, 7:9], band) >= 0.9
-                ):
-                    detected.add((col, row))
-                    break
-    return detected
-
-
-def _supported_color_palettes(
-    palette: tuple[tuple[int, int, int], ...],
-) -> tuple[tuple[tuple[int, int, int], ...], ...]:
-    colors = np.asarray(palette, dtype=np.float32)
-    variants = (
-        colors,
-        np.repeat(colors.mean(axis=1, keepdims=True), 3, axis=1),
-        colors * 0.55,
-        colors * 1.35,
-        np.where(colors > 127.0, 255.0, 0.0),
-        255.0 - colors,
-    )
-    return tuple(
-        tuple(tuple(int(channel) for channel in color) for color in np.clip(variant, 0, 255).astype(np.uint8))
-        for variant in variants
-    )
-
-
-def _color_fraction(patch: np.ndarray, color: tuple[int, int, int]) -> float:
-    if patch.size == 0:
-        return 0.0
-    return float(np.mean(np.all(patch == np.asarray(color, dtype=np.uint8), axis=2)))
-
-
 def _tile_from_center(center_px: tuple[float, float]) -> tuple[int, int]:
     return int(center_px[0] // TILE_SIZE), int(center_px[1] // TILE_SIZE)
+
+
+def _tile_manhattan(left: tuple[int, int], right: tuple[int, int]) -> int:
+    return abs(left[0] - right[0]) + abs(left[1] - right[1])
 
 
 def _entity_from_detection(detection: dict | None, kind: str) -> EntityState | None:
@@ -204,15 +160,6 @@ def _entity_from_detection(detection: dict | None, kind: str) -> EntityState | N
         entity_type=str(detection.get("entity_type", "")),
         confidence=float(detection.get("confidence", 1.0)),
     )
-
-
-def _snap_entity_to_grid(entity: EntityState, candidate_tiles: set[tuple[int, int]]) -> EntityState:
-    if not candidate_tiles:
-        return entity
-    best_tile = min(candidate_tiles, key=lambda tile: abs(tile[0] - entity.tile[0]) + abs(tile[1] - entity.tile[1]))
-    if abs(best_tile[0] - entity.tile[0]) + abs(best_tile[1] - entity.tile[1]) <= 1:
-        return replace(entity, tile=best_tile)
-    return entity
 
 
 def _first_tile(grid: np.ndarray, code: int) -> tuple[int, int] | None:

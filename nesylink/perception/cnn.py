@@ -25,7 +25,9 @@ DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
 DEFAULT_DATASET = DEFAULT_DATA_DIR / "perception_dataset.npz"
 DEFAULT_WEIGHTS = Path(__file__).resolve().parent / "perception_model.pt"
 BUILTIN_TASKS = tuple(f"mathematical_logic/task_{idx}" for idx in range(1, 6))
-IMAGE_VARIANTS = ("default", "grayscale", "dark", "bright", "high_contrast", "inverted")
+COLOR_IMAGE_VARIANTS = ("default", "grayscale", "dark", "bright", "high_contrast", "inverted")
+REDRAW_IMAGE_VARIANTS = ("redraw_geometric", "redraw_symbols")
+IMAGE_VARIANTS = COLOR_IMAGE_VARIANTS + REDRAW_IMAGE_VARIANTS
 _LUMA_WEIGHTS = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
 
@@ -161,6 +163,11 @@ class PerceptionDataset(_BaseTorchDataset()):
         del Dataset
         data = np.load(dataset_path)
         self.images = data["images"][indices]
+        self.redraw_images = {
+            variant: data[f"images_{variant}"][indices]
+            for variant in REDRAW_IMAGE_VARIANTS
+            if f"images_{variant}" in data.files
+        }
         self.grids = data["grids"][indices]
         if "exit_type_grids" in data.files:
             self.exit_type_grids = data["exit_type_grids"][indices]
@@ -180,6 +187,13 @@ class PerceptionDataset(_BaseTorchDataset()):
         unknown_variants = sorted(set(self.variants) - set(IMAGE_VARIANTS))
         if unknown_variants:
             raise ValueError(f"unsupported image variants: {unknown_variants}")
+        missing_redraw = sorted(
+            (set(self.variants) & set(REDRAW_IMAGE_VARIANTS)) - set(self.redraw_images)
+        )
+        if missing_redraw:
+            raise ValueError(
+                "dataset is missing redraw images for variants: " + ", ".join(missing_redraw)
+            )
         self.torch = torch
 
     def __len__(self) -> int:
@@ -188,7 +202,10 @@ class PerceptionDataset(_BaseTorchDataset()):
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample_index = index // len(self.variants)
         variant = self.variants[index % len(self.variants)]
-        image = apply_image_variant(self.images[sample_index], variant)
+        if variant in self.redraw_images:
+            image = self.redraw_images[variant][sample_index].astype(np.float32) / 255.0
+        else:
+            image = apply_image_variant(self.images[sample_index], variant)
         if self.augment:
             image = _augment_image(image)
         image_tensor = self.torch.from_numpy(np.transpose(image, (2, 0, 1))).float()
@@ -227,6 +244,7 @@ def collect_dataset(config: DatasetConfig) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
 
     images: list[np.ndarray] = []
+    redraw_images: dict[str, list[np.ndarray]] = {variant: [] for variant in REDRAW_IMAGE_VARIANTS}
     grids: list[np.ndarray] = []
     exit_type_grids: list[np.ndarray] = []
     chest_state_grids: list[np.ndarray] = []
@@ -241,6 +259,7 @@ def collect_dataset(config: DatasetConfig) -> Path:
         target_count=builtin_samples,
         rng=rng,
         images=images,
+        redraw_images=redraw_images,
         grids=grids,
         exit_type_grids=exit_type_grids,
         chest_state_grids=chest_state_grids,
@@ -253,6 +272,7 @@ def collect_dataset(config: DatasetConfig) -> Path:
         target_count=exit_overlap_samples,
         rng=rng,
         images=images,
+        redraw_images=redraw_images,
         grids=grids,
         exit_type_grids=exit_type_grids,
         chest_state_grids=chest_state_grids,
@@ -265,6 +285,7 @@ def collect_dataset(config: DatasetConfig) -> Path:
         target_count=random_samples,
         rng=rng,
         images=images,
+        redraw_images=redraw_images,
         grids=grids,
         exit_type_grids=exit_type_grids,
         chest_state_grids=chest_state_grids,
@@ -278,6 +299,10 @@ def collect_dataset(config: DatasetConfig) -> Path:
     np.savez_compressed(
         output,
         images=np.stack(images).astype(np.uint8),
+        **{
+            f"images_{variant}": np.stack(variant_images).astype(np.uint8)
+            for variant, variant_images in redraw_images.items()
+        },
         grids=np.stack(grids).astype(np.uint8),
         exit_type_grids=np.stack(exit_type_grids).astype(np.uint8),
         chest_state_grids=np.stack(chest_state_grids).astype(np.uint8),
@@ -781,7 +806,8 @@ def predict_frame(
     player = None
     if player_conf >= confidence_threshold:
         y, x = np.unravel_index(int(np.argmax(heatmaps[0])), heatmaps[0].shape)
-        player = {"center_px": (float(x), float(y)), "confidence": player_conf}
+        center_x, center_y = _refine_peak_center(heatmaps[0], int(x), int(y))
+        player = {"center_px": (center_x, center_y), "confidence": player_conf}
     elif np.any(grid == TILE_PLAYER):
         y, x = np.argwhere(grid == TILE_PLAYER)[0]
         player = {
@@ -789,10 +815,16 @@ def predict_frame(
             "confidence": 0.0,
         }
 
-    monsters = [
-        {"center_px": (float(x), float(y)), "confidence": float(conf), "entity_type": "unknown"}
-        for x, y, conf in _peaks_from_heatmap(heatmaps[1], threshold=confidence_threshold, max_peaks=8)
-    ]
+    monsters = []
+    for x, y, conf in _peaks_from_heatmap(heatmaps[1], threshold=confidence_threshold, max_peaks=8):
+        center_x, center_y = _refine_peak_center(heatmaps[1], x, y)
+        monsters.append(
+            {
+                "center_px": (center_x, center_y),
+                "confidence": float(conf),
+                "entity_type": "unknown",
+            }
+        )
     if not monsters:
         for y, x in np.argwhere(grid == TILE_MONSTER):
             monsters.append(
@@ -826,6 +858,7 @@ def _collect_builtin_samples(
     target_count: int,
     rng: random.Random,
     images: list[np.ndarray],
+    redraw_images: dict[str, list[np.ndarray]],
     grids: list[np.ndarray],
     exit_type_grids: list[np.ndarray],
     chest_state_grids: list[np.ndarray],
@@ -843,11 +876,17 @@ def _collect_builtin_samples(
         env = make_env(task_id=task_id, observation_mode="full", render_mode="rgb_array")
         label, _info = env.reset(seed=rng.randrange(10_000_000))
         for _ in range(per_task):
+            runtime = env.engine.runtime
+            room_id = rng.choice(tuple(runtime.room_manager.room_ids))
+            runtime.room_coord = runtime.room_manager.coord_for_room_id(room_id)
+            runtime.room = runtime.room_manager.get_room(runtime.room_coord)
+            _randomize_player_pose(env, rng)
             _randomize_visible_chest_states(env, rng)
             _append_sample(
                 env,
                 label,
                 images,
+                redraw_images,
                 grids,
                 exit_type_grids,
                 chest_state_grids,
@@ -871,6 +910,7 @@ def _collect_exit_overlap_samples(
     target_count: int,
     rng: random.Random,
     images: list[np.ndarray],
+    redraw_images: dict[str, list[np.ndarray]],
     grids: list[np.ndarray],
     exit_type_grids: list[np.ndarray],
     chest_state_grids: list[np.ndarray],
@@ -914,6 +954,7 @@ def _collect_exit_overlap_samples(
                         env,
                         label,
                         images,
+                        redraw_images,
                         grids,
                         exit_type_grids,
                         chest_state_grids,
@@ -934,6 +975,7 @@ def _collect_random_room_samples(
     target_count: int,
     rng: random.Random,
     images: list[np.ndarray],
+    redraw_images: dict[str, list[np.ndarray]],
     grids: list[np.ndarray],
     exit_type_grids: list[np.ndarray],
     chest_state_grids: list[np.ndarray],
@@ -956,11 +998,13 @@ def _collect_random_room_samples(
         env = make_env(map_path=room_path, observation_mode="full", render_mode="rgb_array", max_monsters=max_monsters)
         label, _info = env.reset(seed=rng.randrange(10_000_000))
         for _ in range(rng.randint(3, 9)):
+            _randomize_player_pose(env, rng)
             _randomize_visible_chest_states(env, rng)
             _append_sample(
                 env,
                 label,
                 images,
+                redraw_images,
                 grids,
                 exit_type_grids,
                 chest_state_grids,
@@ -983,6 +1027,7 @@ def _append_sample(
     env: Any,
     label: dict[str, np.ndarray],
     images: list[np.ndarray],
+    redraw_images: dict[str, list[np.ndarray]],
     grids: list[np.ndarray],
     exit_type_grids: list[np.ndarray],
     chest_state_grids: list[np.ndarray],
@@ -991,24 +1036,28 @@ def _append_sample(
     monster_masks: list[np.ndarray],
     max_monsters: int,
 ) -> None:
+    del label
     frame = env.render()[:MAP_PIXEL_HEIGHT, :MAP_PIXEL_WIDTH].astype(np.uint8)
     from nesylink.core.observation import room_observation
+    from utils.evaluate_policy import redraw_obs_from_state
 
     runtime = env.engine.runtime
     grid = room_observation(runtime.room, runtime.player).astype(np.uint8)
     exit_type_grid = _exit_type_grid_from_env(env)
     chest_state_grid = _chest_state_grid_from_env(env)
-    player_center = np.asarray(label["player_position_px"], dtype=np.float32) + TILE_SIZE * 0.5
+    player_center = np.asarray(runtime.player.position_px, dtype=np.float32) + runtime.player.size_px * 0.5
     centers = np.full((max_monsters, 2), -1.0, dtype=np.float32)
     masks = np.zeros((max_monsters,), dtype=np.bool_)
-    raw_centers = np.asarray(label.get("monsters_position_px", []), dtype=np.float32)
-    raw_masks = np.asarray(label.get("monsters_active_mask", []), dtype=np.bool_)
-    count = min(max_monsters, len(raw_centers), len(raw_masks))
-    if count:
-        centers[:count] = raw_centers[:count] + TILE_SIZE * 0.5
-        masks[:count] = raw_masks[:count]
+    for index, monster in enumerate(runtime.room.monsters.values()):
+        if index >= max_monsters:
+            break
+        centers[index] = np.asarray(monster.position_px, dtype=np.float32) + monster.size_px * 0.5
+        masks[index] = True
 
     images.append(frame)
+    for variant, variant_images in redraw_images.items():
+        preset = variant.removeprefix("redraw_")
+        variant_images.append(redraw_obs_from_state(env, preset=preset, shape=frame.shape))
     grids.append(grid)
     exit_type_grids.append(exit_type_grid)
     chest_state_grids.append(chest_state_grid)
@@ -1072,6 +1121,9 @@ def _random_room_payload(rng: random.Random) -> dict[str, Any]:
     for idx in range(rng.randint(0, 2)):
         if (pos := take_tile()) is not None:
             objects.append({"id": f"button_{idx}", "kind": "button", "pos": list(pos)})
+    for idx in range(rng.randint(1, 4)):
+        if (pos := take_tile()) is not None:
+            objects.append({"id": f"npc_{idx}", "kind": "npc", "pos": list(pos), "text": "..."})
     for idx in range(rng.randint(0, 3)):
         if (pos := take_tile()) is not None:
             objects.append(
@@ -1161,8 +1213,37 @@ def _randomize_visible_chest_states(env: Any, rng: random.Random) -> None:
     """为训练采集生成关闭/打开宝箱帧；不在推理阶段使用。"""
 
     for chest in env.engine.runtime.room.chests.values():
+        if not chest.is_visible and chest.reveal_on:
+            chest.is_visible = True
         if chest.is_visible:
             chest.is_open = rng.random() < 0.45
+
+
+def _randomize_player_pose(env: Any, rng: random.Random) -> None:
+    """Place the player across free tiles, including poses next to obstacles."""
+    from nesylink.core.state import move_with_tile_collisions, tile_to_top_left_px
+
+    runtime = env.engine.runtime
+    room = runtime.room
+    occupied = set(room.runtime_blocking_tiles()) | {monster.tile_pos for monster in room.monsters.values()}
+    candidates = [
+        (x, y)
+        for y in range(GRID_HEIGHT)
+        for x in range(GRID_WIDTH)
+        if (x, y) not in occupied
+    ]
+    if not candidates:
+        return
+    tile = rng.choice(candidates)
+    base_position = tile_to_top_left_px(tile)
+    runtime.player.position_px = move_with_tile_collisions(
+        base_position,
+        runtime.player.size_px,
+        (float(rng.randint(-2, 2)), float(rng.randint(-2, 2))),
+        room.runtime_blocking_tiles(),
+    )
+    runtime.player.facing = rng.choice(("up", "down", "left", "right"))
+    runtime.player.clear_action()
 
 
 def _fallback_exit_type_grids(grids: np.ndarray) -> np.ndarray:
@@ -1284,6 +1365,27 @@ def _peaks_from_heatmap(
         if all(math.hypot(x - px, y - py) >= min_distance_px for px, py, _ in peaks):
             peaks.append((int(x), int(y), conf))
     return peaks
+
+
+def _refine_peak_center(
+    heatmap: np.ndarray,
+    peak_x: int,
+    peak_y: int,
+    *,
+    radius: int = 4,
+    power: int = 8,
+) -> tuple[float, float]:
+    """Refine an integer heatmap maximum to a stable sub-pixel center."""
+    x0 = max(0, peak_x - radius)
+    x1 = min(heatmap.shape[1], peak_x + radius + 1)
+    y0 = max(0, peak_y - radius)
+    y1 = min(heatmap.shape[0], peak_y + radius + 1)
+    patch = np.maximum(heatmap[y0:y1, x0:x1] - 0.05, 0.0) ** power
+    total = float(patch.sum())
+    if total <= 1e-12:
+        return float(peak_x), float(peak_y)
+    ys, xs = np.mgrid[y0:y1, x0:x1]
+    return float((xs * patch).sum() / total), float((ys * patch).sum() / total)
 
 
 def _tiles_from_heatmap(heatmap: np.ndarray, *, threshold: float, max_peaks: int) -> list[tuple[int, int]]:
