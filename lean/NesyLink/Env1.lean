@@ -1,3 +1,4 @@
+-- 游戏环境形式化
 def Coord := Fin 8 × Fin 10
 deriving instance DecidableEq for Coord
 

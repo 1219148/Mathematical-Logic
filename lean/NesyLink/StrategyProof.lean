@@ -1,3 +1,4 @@
+-- 策略性质的证明
 import NesyLink.Env1
 import NesyLink.Env2
 import NesyLink.Strategy

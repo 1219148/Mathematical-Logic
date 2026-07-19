@@ -1,3 +1,4 @@
+-- 为了证明安全性与活性定理而引入的公理集合
 import NesyLink.Env1
 import NesyLink.Env2
 import NesyLink.Strategy
