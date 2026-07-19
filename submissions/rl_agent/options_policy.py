@@ -156,7 +156,7 @@ class OptionsRLPolicy:
         if isinstance(obs, dict) and "grid" in obs:
             return symbolic_state_from_grid_obs(obs, info)
         if self.perception_engine is None:
-            from nesylink.perception import PerceptionEngine
+            from submissions.perception import PerceptionEngine
 
             self.perception_engine = PerceptionEngine(device="cpu")
         return self.perception_engine.extract(obs)

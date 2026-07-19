@@ -688,7 +688,7 @@ def first_preventive_shield_step(path: list[Position], state: SymbolicState, con
 class Policy:
     def __init__(self, perception_engine=None, config: PlannerConfig | None = None) -> None:
         if perception_engine is None:
-            from nesylink.perception import PerceptionEngine
+            from submissions.perception import PerceptionEngine
 
             perception_engine = PerceptionEngine(device="cpu")
         self.perception_engine = perception_engine

@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from nesylink.env import make_env
-from nesylink.perception import PerceptionEngine
+from submissions.perception import PerceptionEngine
 
 try:
     from .features import state_key_from_symbolic_state
