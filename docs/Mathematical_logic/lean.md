@@ -54,7 +54,7 @@ inductive Action where
 
 **输入结构：**
 
-每一个时刻的输入由两个部分组成：动作和方向。我们规定：如果动作是移动，那么方向是玩家将要移动的方向；如果动作是另外三个，那么方向是当前玩家朝向。在 Lean 中，我们用一个结构体来建模输入：
+每一个时刻的输入由两个部分组成：动作和方向。我们规定：如果动作是移动，那么方向是玩家将要移动的方向；如果动作是另外三个，那么方向是交互的方向。在 Lean 中，我们用一个结构体来建模输入：
 
 ```lean
 structure Input where
@@ -81,7 +81,6 @@ inductive Tile where
 ```
 
 特别解释一下bridge的三个参数：switchRoom是控制当前桥的开关的房间号，switchCoord是开关在相应房间的坐标，activeState是一个状态值（例如在第四关中桥有三种状态，那么这个值就取0、1、2），当桥的状态值与相应开关的状态值相等时才能安全通过。
-另外，我们对陷阱进行了简化，即认为所有陷阱都是spike（扣血并回到当前房间出生点），而不考虑更复杂的abyss陷阱。
 
 **物品：**
 
@@ -371,6 +370,8 @@ inductive steps : GameState → AgentState → Nat → GameState → AgentState 
 
 ## 3. 定理与证明
 
+我们没有对针对task5的 global_planner 进行性质证明，而是证明了 local_planner 的以下性质。
+
 ### 3.1 定理概览
 
 | 定理 | 类型 | 直观含义 | 形式陈述 |
@@ -604,6 +605,22 @@ have hPreserved : gsMid.player.hasSword = gs.player.hasSword :=
 ```
 
 这是一种**工程折中**——理想情况下公理应直接陈述正向命题，但受限于工具链的解析器 bug 而采用双重否定包装。
+
+### 3.4 Lean 4.29-rc6 兼容性问题
+
+在形式化过程中遇到以下工具链兼容性问题及解决方案：
+
+| # | 问题 | 表现 | 解决方案 | 影响范围 |
+|---|------|------|----------|----------|
+| 1 | `lemma` 关键字解析 bug | `lemma foo ... :=` 导致解析失败 | 统一使用 `theorem` | 全部定理 |
+| 2 | `→` 在返回类型中解析失败 | `axiom f ... : A → B` 解析失败 | 用 `¬ (¬ (A → B))` 包装，或改写为 `∀` 参数 | 全部公理 |
+| 3 | `= expr` 在返回类型末尾解析失败 | `axiom f ... : ... = expr` 解析失败 | 添加额外的显式 binder 参数 | 部分公理 |
+| 4 | `by_contra` 对 `∃` 目标失败 | `by_contra h; ...` 在 `∃` 目标上类型错误 | 改用 `by_cases hProgress : ∃ ... ; · exact hProgress; · exfalso; ...` | 定理 3&4 核心推理 |
+| 5 | `Classical.byContra` 不可用 | 函数名不存在于此 Lean 版本 | 用 `not_not_elim` 自定义引理替代 | 定理 3&4 全部 |
+| 6 | `Nat.strong_induction_on` 不可用 | 函数名不存在 | 使用 `Nat.strongRecOn` | 定理 3&4 归纳启动 |
+| 7 | `inductive ... :=` 弃用警告 | 编译器警告 | 改用 `inductive ... where` 语法 | `steps` 定义 |
+
+其中**问题 1（双重否定包装）**影响最深远——它迫使所有公理的返回类型加上 `¬ (¬ ...)`，进而要求整个证明体系中频繁使用 `not_not_elim`。这在可读性上是不理想的，但它是保证在目标工具链上通过编译的必要手段。
 
 ---
 
