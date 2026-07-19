@@ -17,7 +17,7 @@ from nesylink.core.constants import (
     ACTION_UP,
     TILE_SIZE,
 )
-from nesylink.shared import SymbolicState
+from submissions.shared import SymbolicState
 
 from submissions.temporal_filter import TemporalSymbolicFilter
 

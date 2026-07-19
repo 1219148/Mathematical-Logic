@@ -20,7 +20,7 @@ from nesylink.core.observation import (
     TILE_TRAP,
     TILE_WALL,
 )
-from nesylink.shared import EntityState, SymbolicState
+from submissions.shared import EntityState, SymbolicState
 
 
 DEFAULT_WEIGHTS = Path(__file__).resolve().with_name("perception_model.pt")

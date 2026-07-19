@@ -682,7 +682,12 @@ def load_model(
     *,
     device: str | None = None,
 ) -> tuple[Any, Any]:
-    torch, _, _ = _torch_modules()
+    try:
+        torch, _, _ = _torch_modules()
+    except ModuleNotFoundError:
+        from .numpy_inference import load_numpy_model
+
+        return load_numpy_model(weights_path), None
     resolved_device = _v14._resolve_device(torch, device)
     checkpoint = _load_checkpoint(weights_path, torch, resolved_device)
     model = TinyPerceptionCNN(
@@ -851,22 +856,14 @@ def predict_frame(
             confidence_threshold=confidence_threshold,
         )
 
-    torch = torch_module if torch_module is not None else _torch_modules()[0]
-    resolved_device = _v14._resolve_device(torch, device)
     image = _v14.apply_image_variant(frame, "default")
-    tensor = (
-        torch.from_numpy(np.transpose(image, (2, 0, 1)))
-        .unsqueeze(0)
-        .float()
-        .to(resolved_device)
-    )
-    with torch.no_grad():
-        output = model(tensor)
-        raw_grid = output["tile_logits"].argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+    if getattr(model, "is_numpy_backend", False):
+        from .numpy_inference import sigmoid, softmax
+
+        output = model(np.transpose(image, (2, 0, 1)))
+        raw_grid = output["tile_logits"].argmax(axis=0).astype(np.uint8)
         if model.exit_type_head_available and "exit_type_logits" in output:
-            exit_type_probabilities = (
-                torch.softmax(output["exit_type_logits"], dim=1)[0].cpu().numpy()
-            )
+            exit_type_probabilities = softmax(output["exit_type_logits"], axis=0)
             exit_type_grid = exit_type_probabilities.argmax(axis=0).astype(np.uint8)
         else:
             exit_type_probabilities = None
@@ -875,26 +872,69 @@ def predict_frame(
             getattr(model, "has_trained_chest_state_head", True)
             and "chest_state_logits" in output
         ):
-            chest_state_probabilities = (
-                torch.softmax(output["chest_state_logits"], dim=1)[0].cpu().numpy()
-            )
+            chest_state_probabilities = softmax(output["chest_state_logits"], axis=0)
             chest_state_grid = chest_state_probabilities.argmax(axis=0).astype(np.uint8)
         else:
             chest_state_probabilities = None
             chest_state_grid = _v14._fallback_chest_state_grids(raw_grid[None, ...])[0]
-        heatmaps = torch.sigmoid(output["heatmap_logits"])[0].cpu().numpy()
-        occupancy_probabilities = (
-            torch.sigmoid(output["occupancy_logits"])[0].cpu().numpy()
-        )
+        heatmaps = sigmoid(output["heatmap_logits"])
+        occupancy_probabilities = sigmoid(output["occupancy_logits"])
         player_offset_available = bool(
             getattr(model, "has_trained_player_offset_head", False)
             or getattr(model, "has_trained_offset_head", False)
         )
         offset_map = (
-            torch.tanh(output["offset_logits"])[0].cpu().numpy() * ENTITY_OFFSET_SCALE
+            np.tanh(output["offset_logits"]) * ENTITY_OFFSET_SCALE
             if player_offset_available
             else None
         )
+    else:
+        torch = torch_module if torch_module is not None else _torch_modules()[0]
+        resolved_device = _v14._resolve_device(torch, device)
+        tensor = (
+            torch.from_numpy(np.transpose(image, (2, 0, 1)))
+            .unsqueeze(0)
+            .float()
+            .to(resolved_device)
+        )
+        with torch.no_grad():
+            output = model(tensor)
+            raw_grid = (
+                output["tile_logits"].argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+            )
+            if model.exit_type_head_available and "exit_type_logits" in output:
+                exit_type_probabilities = (
+                    torch.softmax(output["exit_type_logits"], dim=1)[0].cpu().numpy()
+                )
+                exit_type_grid = exit_type_probabilities.argmax(axis=0).astype(np.uint8)
+            else:
+                exit_type_probabilities = None
+                exit_type_grid = _v14._fallback_exit_type_grids(raw_grid[None, ...])[0]
+            if (
+                getattr(model, "has_trained_chest_state_head", True)
+                and "chest_state_logits" in output
+            ):
+                chest_state_probabilities = (
+                    torch.softmax(output["chest_state_logits"], dim=1)[0].cpu().numpy()
+                )
+                chest_state_grid = chest_state_probabilities.argmax(axis=0).astype(np.uint8)
+            else:
+                chest_state_probabilities = None
+                chest_state_grid = _v14._fallback_chest_state_grids(raw_grid[None, ...])[0]
+            heatmaps = torch.sigmoid(output["heatmap_logits"])[0].cpu().numpy()
+            occupancy_probabilities = (
+                torch.sigmoid(output["occupancy_logits"])[0].cpu().numpy()
+            )
+            player_offset_available = bool(
+                getattr(model, "has_trained_player_offset_head", False)
+                or getattr(model, "has_trained_offset_head", False)
+            )
+            offset_map = (
+                torch.tanh(output["offset_logits"])[0].cpu().numpy()
+                * ENTITY_OFFSET_SCALE
+                if player_offset_available
+                else None
+            )
 
     player_tile = _player_tile_from_occupancy(occupancy_probabilities[0])
     monster_tiles = _monster_tiles_from_occupancy(

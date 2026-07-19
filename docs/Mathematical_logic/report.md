@@ -475,14 +475,14 @@ macOS 上如果出现 SSL 证书问题，可临时使用：
 | --- | --- |
 | Policy 文件 | `submissions/student_agent.py` |
 | 辅助模块 | `submissions/temporal_filter.py`（时序符号滤波）与 `submissions/perception/`（像素感知） |
-| 感知模型权重 | `submissions/perception/perception_model.pt` |
+| 感知模型权重 | `submissions/perception/perception_model.pt`、`submissions/perception/perception_model.npz` |
 | RL 模型权重（可选） | `submissions/rl_agent/models/q_table.pkl`、`submissions/rl_agent/models/options_q.pkl` |
 | 测评脚本 | `utils/evaluate_policy.py` |
 | 代码版本（Git commit） | 本次提交（以仓库 `HEAD` 为准） |
 | Python 版本 | `>=3.10` |
 | 环境配置 | `observation_mode="pixels"`, `action_repeat=1`（未覆盖） |
 
-为保证提交包内的感知代码、模型权重和训练数据路径完整可复现，`nesylink/perception` 已整体复制到 `submissions/perception`。复制版 `cnn.py` 对同目录的 `cnn_base_v14.py` 使用相对导入，`student_agent.py` 与 options RL 入口均显式加载 `submissions.perception.PerceptionEngine`；环境提供的 `nesylink.core`、`nesylink.shared` 等公开类型接口保持不变。兼容性验证覆盖了 Python 包导入、按文件路径加载 policy、CNN 权重加载、单帧符号提取以及完整 episode，确认运行时不会回退到原 `nesylink.perception.cnn`。
+为保证提交包内的感知代码、模型权重和训练数据路径完整可复现，`nesylink/perception` 已整体复制到 `submissions/perception`。复制版 `cnn.py` 对同目录的 `cnn_base_v14.py` 使用相对导入，`student_agent.py` 与 options RL 入口均显式加载 `submissions.perception.PerceptionEngine`。以官方测评仓库 `CrazyJassBread/nesylink@036df78` 比对后，确认官方代码不包含 `nesylink.shared`，因此将感知与规划共用的 `EntityState`、`SymbolicState` 收入 `submissions/shared.py`，提交代码只依赖官方公开的 `nesylink.core`、`nesylink.env` 等接口。官方基础依赖也未声明 PyTorch，因此额外提供从同一 CNN 权重导出的 `perception_model.npz` 与纯 NumPy 推理后端；安装 PyTorch 时仍走原 `.pt` 后端，没有 PyTorch 时自动回退，`PerceptionEngine` 与 policy 接口不变。兼容性验证在只安装官方 `pyproject.toml` 依赖的全新虚拟环境中完成：按文件路径加载 policy、单帧动作、Task 1 default（283 步）和 Task 5 default（1188 步）均成功，两个 episode 都触发 `world_completed`；另抽样 60 帧比较 PyTorch/NumPy 后端，语义图、玩家/怪物 tile、宝箱状态和出口类型完全一致。
 
 ### 8.2 任务默认配置（未覆盖）
 

@@ -19,7 +19,7 @@ from nesylink.core.constants import (
     ACTION_UP,
 )
 from nesylink.core.observation import TILE_NPC
-from nesylink.shared import SymbolicState
+from submissions.shared import SymbolicState
 
 
 Position = tuple[int, int]
@@ -630,7 +630,7 @@ def side_approach_goals(state: SymbolicState, side: Side, extra_blocked: set[Pos
 
 
 def symbolic_state_from_grid_obs(obs: dict[str, np.ndarray], info: dict[str, Any]) -> SymbolicState:
-    from nesylink.shared import SymbolicState
+    from submissions.shared import SymbolicState
 
     grid = np.asarray(obs["grid"], dtype=np.uint8)
     player = tuple(int(v) for v in np.asarray(obs["player_tile"]).tolist())

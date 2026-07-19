@@ -2175,8 +2175,18 @@ def _decode_exit_side_pairs(
                 float(confidences[first[1], first[0]])
                 + float(confidences[second[1], second[0]])
             )
-            candidates.append((score, -abs(index + 0.5 - middle), first, second))
-        score, _center_bias, first, second = max(candidates)
+            # Different BLAS backends can vary by a few ULPs. Quantization and
+            # structural tie-breaking keep doorway decoding backend-independent.
+            candidates.append(
+                (
+                    round(score, 5),
+                    -abs(index + 0.5 - middle),
+                    -index,
+                    first,
+                    second,
+                )
+            )
+        score, _center_bias, _index_bias, first, second = max(candidates)
         bridge_reaches_side = any(
             abs(edge[0] - bridge[0]) + abs(edge[1] - bridge[1]) <= 1
             for edge in positions
@@ -2213,7 +2223,7 @@ def _restore_player_occluded_exit_pair(
                 companion = (side_x, candidate_y)
                 candidates.append(
                     (
-                        float(confidences[candidate_y, side_x]),
+                        round(float(confidences[candidate_y, side_x]), 5),
                         -abs(candidate_y - middle),
                         projected,
                         companion,
@@ -2228,7 +2238,7 @@ def _restore_player_occluded_exit_pair(
                 companion = (candidate_x, side_y)
                 candidates.append(
                     (
-                        float(confidences[side_y, candidate_x]),
+                        round(float(confidences[side_y, candidate_x]), 5),
                         -abs(candidate_x - middle),
                         projected,
                         companion,

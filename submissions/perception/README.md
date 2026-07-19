@@ -34,7 +34,8 @@ state = PerceptionEngine(device="cpu").extract(frame)
 
 ## 返回结构
 
-`extract` 返回 `SymbolicState`，定义在 `nesylink/shared/types.py`。
+`extract` 返回 `SymbolicState`，定义在提交包内的 `submissions/shared.py`，不依赖
+官方仓库中不存在的 `nesylink.shared`。
 
 常用字段：
 
@@ -73,12 +74,14 @@ entity.confidence  # CNN heatmap 置信度
 
 ## CNN 输出逻辑
 
-模型在 `cnn.py` 中，主体是 `TinyPerceptionCNN`。它有四个 head：
+模型在 `cnn.py` 中，主体是 `TinyPerceptionCNN`。它有五个 head：
 
 - `tile_head`：输出 `8 x 10` 语义图，负责墙、宝箱、出口、陷阱、按钮、桥、缺口等 tile 级信息。
 - `exit_type_head`：输出 `8 x 10` 出口类型图，负责区分 `normal`、`locked_key`、`conditional`。
 - `chest_state_head`：输出独立的 `8 x 10` 宝箱状态图，负责区分 `none`、`closed`、`opened`；因此宝箱可以与桥等地形共用同一 tile。
 - `heatmap_head`：输出玩家/怪物的像素级中心点 heatmap，负责动态实体的精确位置。
+- `occupancy_head`：独立输出玩家/怪物的 `8 x 10` 占据概率，避免动态实体与桥、出口等
+  共享 tile 时被单标签语义图覆盖。
 
 所以 perception 不是只返回 tile，也不是只返回 pixel，而是混合表示：
 
@@ -104,15 +107,21 @@ inverted       RGB 反色
 submissions/perception/engine.py                 # 对外统一入口
 submissions/perception/cnn.py                    # CNN、数据采集、训练、评估
 submissions/perception/perception_model.pt       # 默认权重
+submissions/perception/numpy_inference.py         # 无 PyTorch 时的 NumPy CNN 后端
+submissions/perception/perception_model.npz      # 同一 CNN 的 NumPy 兼容权重
 submissions/perception/data/perception_dataset.npz
 submissions/perception/data/generated_maps/      # 随机生成的训练地图
 ```
 
-默认 `PerceptionEngine()` 会加载：
+默认 `PerceptionEngine()` 会优先加载：
 
 ```text
 submissions/perception/perception_model.pt
 ```
+
+官方仓库的基础依赖没有声明 PyTorch。若运行环境未安装 PyTorch，入口会自动使用
+`perception_model.npz` 和 `numpy_inference.py` 完成同一 CNN 的前向推理；无需修改
+`PerceptionEngine`、`make_policy` 或 `act` 接口，也不使用颜色模板或关卡特判。
 
 如果要加载别的权重：
 
@@ -192,7 +201,11 @@ high_contrast  1.000000       0.992021       0.000042
 inverted       0.968468       0.978723       0.000403
 ```
 
-端到端单种子回归：Task 1 grayscale 在 290 步完成，Task 2 default 在 166 步完成，Task 3 spatial_b 在 566 步完成，Task 4 default 在 1119 步完成并触发 `world_completed`。Task 5 default 未通过；该策略没有收到/设置 `task_id`，因此未进入 Task 5 专用分支，不属于本次感知修改范围。
+以官方仓库 `CrazyJassBread/nesylink@036df78` 为基准，将 `submissions/` 单独复制到
+仓库根目录，并在只安装官方 `pyproject.toml` 依赖（无 PyTorch、无
+`nesylink.shared`）的全新虚拟环境中回归：Task 1 default 在 283 步完成，Task 5
+default 在 1188 步完成，两者均触发 `world_completed`。另外抽样 60 帧对比 PyTorch
+与 NumPy CNN，语义图、玩家/怪物 tile、宝箱状态和出口类型输出全部一致。
 
 单帧 CPU 推理耗时：
 
@@ -200,6 +213,7 @@ inverted       0.968468       0.978723       0.000403
 首次调用，包含加载权重: 约 32 ms
 模型已加载后，默认 64 CPU 线程: 约 8 ms / frame
 16 CPU 线程: 约 6 ms / frame
+仅 NumPy 兼容后端: 约 0.2 s / frame（用于官方基础依赖下的可运行兜底）
 ```
 
 如果用于 agent 循环，建议在程序开头限制线程数：

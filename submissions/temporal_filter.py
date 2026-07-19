@@ -4,7 +4,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, replace
 
 from nesylink.core.observation import TILE_MONSTER
-from nesylink.shared import SymbolicState
+from submissions.shared import SymbolicState
 
 
 Position = tuple[int, int]
